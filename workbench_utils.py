@@ -1,3 +1,6 @@
+"""Utility functions for Islandora Workbench.
+"""
+
 import os
 import sys
 import json
@@ -18,6 +21,7 @@ import urllib.parse
 from pathlib import Path
 from ruamel.yaml import YAML, YAMLError
 from unidecode import unidecode
+from progress_bar import InitBar
 import edtf_validate.valid_edtf
 import shutil
 import http.client
@@ -30,6 +34,8 @@ EXECUTION_START_TIME = datetime.datetime.now()
 INTEGRATION_MODULE_MIN_VERSION = '1.0'
 # Workaround for https://github.com/mjordan/islandora_workbench/issues/360.
 http.client._MAXHEADERS = 10000
+http_response_times = []
+# Global lists of terms to reduce queries to Drupal.
 checked_terms = list()
 newly_created_terms = list()
 
@@ -103,9 +109,15 @@ def issue_request(
     """Issue the HTTP request to Drupal. Note: calls to non-Drupal URLs
        do not use this function.
     """
+    if not config['password']:
+        message = 'Password for Drupal user not found. Please add the "password" option to your configuration ' + \
+            'file or provide the Drupal user\'s password in your ISLANDORA_WORKBENCH_PASSWORD environment variable.'
+        logging.error(message)
+        sys.exit("Error: " + message)
+
     if config['check'] is False:
-        if 'pause' in config and method in ['POST', 'PUT', 'PATCH', 'DELETE']:
-            time.sleep(config['pause'])
+        if 'pause' in config and method in ['POST', 'PUT', 'PATCH', 'DELETE'] and value_is_numeric(config['pause']):
+            time.sleep(int(config['pause']))
 
     headers.update({'User-Agent': config['user_agent']})
 
@@ -197,6 +209,30 @@ def issue_request(
 
     if config['log_response_body'] is True:
         logging.info(response.text)
+
+    response_time = response.elapsed.total_seconds()
+    average_response_time = calculate_response_time_trend(config, response_time)
+
+    log_response_time_value = copy.copy(config['log_response_time'])
+    if 'adaptive_pause' in config and value_is_numeric(config['adaptive_pause']):
+        # Pause defined in config['adaptive_pause'] is included in the response time,
+        # so we subtract it to get the "unpaused" response time.
+        if average_response_time is not None and (response_time - int(config['adaptive_pause'])) > (average_response_time * int(config['adaptive_pause_threshold'])):
+            message = "HTTP requests paused for " + str(config['adaptive_pause']) + " seconds because request in next log entry " + \
+                "exceeded adaptive threshold of " + str(config['adaptive_pause_threshold']) + "."
+            time.sleep(int(config['adaptive_pause']))
+            logging.info(message)
+            # Enable response time logging if we surpass the adaptive pause threashold.
+            config['log_response_time'] = True
+
+    if config['log_response_time'] is True:
+        url_for_logging = urllib.parse.urlparse(url).path + '?' + urllib.parse.urlparse(url).query
+        if 'adaptive_pause' in config and value_is_numeric(config['adaptive_pause']):
+            response_time - int(config['adaptive_pause'])
+        response_time_trend_entry = {'method': method, 'response': response.status_code, 'url': url_for_logging, 'response_time': response_time, 'average_response_time': average_response_time}
+        logging.info(response_time_trend_entry)
+        # Set this config option back to what it was before we updated in above.
+        config['log_response_time'] = log_response_time_value
 
     return response
 
@@ -324,19 +360,33 @@ def get_integration_module_version(config):
         return False
 
 
-def ping_node(config, nid):
+def ping_node(config, nid, method='HEAD', return_json=False):
     """Ping the node to see if it exists.
+
+       Note that HEAD requests do not return a response body.
+
+        Parameters
+        ----------
+        method: string
+            Either 'HEAD' or 'GET'.
+        return_json: boolean
+
+        Returns
+        ------
+            True if method is HEAD and node was found, the response JSON response
+            body if method was GET. False if request returns a non-allowed status code.
     """
     url = config['host'] + '/node/' + str(nid) + '?_format=json'
-    response = issue_request(config, 'HEAD', url)
-    # @todo: Add 301 and 302 to the allowed status codes?
-    if response.status_code == 200:
-        return True
+    response = issue_request(config, method.upper(), url)
+    allowed_status_codes = [200, 301, 302]
+    if response.status_code in allowed_status_codes:
+        if return_json is True:
+            return response.text
+        else:
+            return True
     else:
         logging.warning(
-            "Node ping (HEAD) on %s returned a %s status code",
-            url,
-            response.status_code)
+            "Node ping (%s) on %s returned a %s status code", method.upper(), url, response.status_code)
         return False
 
 
@@ -410,8 +460,12 @@ def ping_islandora(config, print_message=True):
 
 
 def ping_content_type(config):
-    url = f"{config['host']}/admin/structure/types/manage/{config['content_type']}"
+    url = f"{config['host']}/entity/entity_form_display/node.{config['content_type']}.default?_format=json"
     return issue_request(config, 'GET', url).status_code
+
+
+def ping_view_path(config, view_url):
+    return issue_request(config, 'HEAD', view_url).status_code
 
 
 def ping_media_bundle(config, bundle_name):
@@ -470,7 +524,7 @@ def get_nid_from_url_alias(config, url_alias):
         return node['nid'][0]['value']
 
 
-def get_nid_from_media_url_alias(config, url_alias):
+def get_mid_from_media_url_alias(config, url_alias):
     """Gets a media ID from a media URL alias. This function also works
        with canonical URLs, e.g. http://localhost:8000/media/1234.
     """
@@ -542,15 +596,9 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             field_definitions[fieldname]['label'] = field_config['label']
             raw_vocabularies = [x for x in field_config['dependencies']['config'] if re.match("^taxonomy.vocabulary.", x)]
             if len(raw_vocabularies) > 0:
-                vocabularies = [x.replace("taxonomy.vocabulary.", '')
-                                for x in raw_vocabularies]
+                vocabularies = [x.replace("taxonomy.vocabulary.", '') for x in raw_vocabularies]
                 field_definitions[fieldname]['vocabularies'] = vocabularies
-            '''
-            if entity_type == 'media' and 'file_extensions' in field_config['settings']:
-                field_definitions[fieldname]['file_extensions'] = field_config['settings']['file_extensions']
-            if entity_type == 'media':
-                field_definitions[fieldname]['media_type'] = bundle_type
-            '''
+
             raw_field_storage = get_entity_field_storage(config, fieldname, entity_type)
             field_storage = json.loads(raw_field_storage)
             field_definitions[fieldname]['field_type'] = field_storage['type']
@@ -565,8 +613,12 @@ def get_field_definitions(config, entity_type, bundle_type=None):
                 field_definitions[fieldname]['target_type'] = None
             if field_storage['type'] == 'typed_relation' and 'rel_types' in field_config['settings']:
                 field_definitions[fieldname]['typed_relations'] = field_config['settings']['rel_types']
+            if 'authority_sources' in field_config['settings']:
+                field_definitions[fieldname]['authority_sources'] = list(field_config['settings']['authority_sources'].keys())
+            else:
+                field_definitions[fieldname]['authority_sources'] = None
 
-        field_definitions['title'] = {'entity_type': 'node', 'required': True, 'label': 'Title', 'field_type': 'string', 'cardinality': 1, 'max_length': 255, 'target_type': None}
+        field_definitions['title'] = {'entity_type': 'node', 'required': True, 'label': 'Title', 'field_type': 'string', 'cardinality': 1, 'max_length': config['max_node_title_length'], 'target_type': None}
 
     if entity_type == 'taxonomy_term':
         fields = get_entity_fields(config, 'taxonomy_term', bundle_type)
@@ -574,13 +626,11 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             field_definitions[fieldname] = {}
             raw_field_config = get_entity_field_config(config, fieldname, entity_type, bundle_type)
             field_config = json.loads(raw_field_config)
-            # print(field_config)
             field_definitions[fieldname]['entity_type'] = field_config['entity_type']
             field_definitions[fieldname]['required'] = field_config['required']
             field_definitions[fieldname]['label'] = field_config['label']
             raw_field_storage = get_entity_field_storage(config, fieldname, entity_type)
             field_storage = json.loads(raw_field_storage)
-            # print(field_storage)
             field_definitions[fieldname]['field_type'] = field_storage['type']
             field_definitions[fieldname]['cardinality'] = field_storage['cardinality']
             if 'max_length' in field_storage['settings']:
@@ -591,6 +641,10 @@ def get_field_definitions(config, entity_type, bundle_type=None):
                 field_definitions[fieldname]['target_type'] = field_storage['settings']['target_type']
             else:
                 field_definitions[fieldname]['target_type'] = None
+            if 'authority_sources' in field_config['settings']:
+                field_definitions[fieldname]['authority_sources'] = list(field_config['settings']['authority_sources'].keys())
+            else:
+                field_definitions[fieldname]['authority_sources'] = None
 
         field_definitions['term_name'] = {'entity_type': 'taxonomy_term', 'required': True, 'label': 'Name', 'field_type': 'string', 'cardinality': 1, 'max_length': 255, 'target_type': None}
 
@@ -611,11 +665,10 @@ def get_entity_fields(config, entity_type, bundle_type):
     """Get all the fields configured on a bundle.
     """
     if ping_content_type(config) == 404:
-        message = f"Content type '{config['content_type']}' not defined on {config['host']}."
+        message = f"Content type '{config['content_type']}' does not exist on {config['host']}."
         logging.error(message)
         sys.exit('Error: ' + message)
-    fields_endpoint = config['host'] + '/entity/entity_form_display/' + \
-        entity_type + '.' + bundle_type + '.default?_format=json'
+    fields_endpoint = config['host'] + '/entity/entity_form_display/' + entity_type + '.' + bundle_type + '.default?_format=json'
     bundle_type_response = issue_request(config, 'GET', fields_endpoint)
     # If a vocabulary has no custom fields (like the default "Tags" vocab), this query will
     # return a 404 response. So, we need to use an alternative way to check if the vocabulary
@@ -647,6 +700,33 @@ def get_entity_fields(config, entity_type, bundle_type):
         sys.exit('Error: ' + message)
 
     return fields
+
+
+def get_required_bundle_fields(config, entity_type, bundle_type):
+    """Gets a list of required fields for the given bundle type.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        entity_type : string
+            One of 'node', 'media', or 'taxonomy_term'.
+        bundle_type : string
+            The (node) content type, the vocabulary name, or the media type (image',
+            'document', 'audio', 'video', 'file', etc.).
+
+        Returns
+        -------
+        list
+            A list of Drupal field names that are configured as required for this bundle.
+    """
+    field_definitions = get_field_definitions(config, entity_type, bundle_type)
+    required_drupal_fields = list()
+    for drupal_fieldname in field_definitions:
+        if 'entity_type' in field_definitions[drupal_fieldname] and field_definitions[drupal_fieldname]['entity_type'] == entity_type:
+            if 'required' in field_definitions[drupal_fieldname] and field_definitions[drupal_fieldname]['required'] is True:
+                required_drupal_fields.append(drupal_fieldname)
+    return required_drupal_fields
 
 
 def get_entity_field_config(config, fieldname, entity_type, bundle_type):
@@ -705,10 +785,16 @@ def check_input(config, args):
         'delete',
         'add_media',
         'delete_media',
-        'create_from_files']
+        'delete_media_by_node',
+        'create_from_files',
+        'create_terms',
+        'export_csv',
+        'get_data_from_view'
+    ]
     joiner = ', '
     if config['task'] not in tasks:
-        message = '"task" in your configuration file must be one of "create", "update", "delete", "add_media", or "create_from_files".'
+        message = '"task" in your configuration file must be one of "create", "update", "delete", ' + \
+            '"add_media", "delete_media", "delete_media_by_node", "create_from_files", "create_terms", "export_csv", or "get_data_from_view".'
         logging.error(message)
         sys.exit('Error: ' + message)
 
@@ -782,9 +868,97 @@ def check_input(config, args):
                 message = 'Please check your config file for required values: ' + joiner.join(delete_media_required_options) + '.'
                 logging.error(message)
                 sys.exit('Error: ' + message)
+    if config['task'] == 'delete_media_by_node':
+        delete_media_by_node_required_options = [
+            'task',
+            'host',
+            'username',
+            'password']
+        for delete_media_by_node_required_option in delete_media_by_node_required_options:
+            if delete_media_by_node_required_option not in config_keys:
+                message = 'Please check your config file for required values: ' + joiner.join(delete_media_by_node_required_options) + '.'
+                logging.error(message)
+                sys.exit('Error: ' + message)
+    if config['task'] == 'export_csv':
+        export_csv_required_options = [
+            'task',
+            'host',
+            'username',
+            'password']
+        for export_csv_required_option in export_csv_required_options:
+            if export_csv_required_option not in config_keys:
+                message = 'Please check your config file for required values: ' + joiner.join(export_csv_required_options) + '.'
+                logging.error(message)
+                sys.exit('Error: ' + message)
+        if config['export_csv_term_mode'] == 'name':
+            message = 'The "export_csv_term_mode" configuration option is set to "name", which will slow down the export.'
+            print(message)
+    if config['task'] == 'create_terms':
+        create_terms_required_options = [
+            'task',
+            'host',
+            'username',
+            'password',
+            'vocab_id']
+        for create_terms_required_option in create_terms_required_options:
+            if create_terms_required_option not in config_keys:
+                message = 'Please check your config file for required values: ' + joiner.join(create_terms_required_options) + '.'
+                logging.error(message)
+                sys.exit('Error: ' + message)
+    if config['task'] == 'get_data_from_view':
+        get_data_from_view_required_options = [
+            'task',
+            'host',
+            'username',
+            'password',
+            'view_path']
+        for get_data_from_view_required_option in get_data_from_view_required_options:
+            if get_data_from_view_required_option not in config_keys:
+                message = 'Please check your config file for required values: ' + joiner.join(get_data_from_view_required_options) + '.'
+                logging.error(message)
+                sys.exit('Error: ' + message)
+
     message = 'OK, configuration file has all required values (did not check for optional values).'
     print(message)
     logging.info(message)
+
+    # Perform checks on get_data_from_view tasks. Since this task doesn't use input_dir, input_csv, etc.,
+    # we exit immediately after doing these checks.
+    if config['task'] == 'get_data_from_view':
+        # First, ping the View.
+        view_url = config['host'] + '/' + config['view_path'].lstrip('/')
+        view_path_status_code = ping_view_path(config, view_url)
+        if view_path_status_code != 200:
+            message = f"Cannot access View at {view_url}."
+            logging.error(message)
+            sys.exit("Error: " + message)
+        else:
+            message = f'View REST export at "{view_url}" is accessible.'
+            logging.info(message)
+            print("OK, " + message)
+
+        # Check to make sure the output path for the CSV file is writable.
+        if config['data_from_view_file_path'] is not None:
+            csv_file_path = config['data_from_view_file_path']
+        else:
+            csv_file_path = os.path.join(config['input_dir'], os.path.basename(args.config).split('.')[0] + '.csv_file_with_data_from_view')
+        csv_file_path_file = open(csv_file_path, "a")
+        if csv_file_path_file.writable() is False:
+            message = f'Path to CSV file "{csv_file_path}" is not writable.'
+            logging.error(message)
+            sys.exit("Error: " + message)
+        else:
+            message = f'CSV output file location at {csv_file_path} is writable.'
+            logging.info(message)
+            print("OK, " + message)
+
+        if os.path.exists(csv_file_path):
+            os.remove(csv_file_path)
+
+        # If nothing has failed by now, exit with a positive, upbeat message.
+        print("Configuration and input data appear to be valid.")
+        logging.info('Configuration checked for "%s" task using config file "%s", no problems found.', config['task'], args.config)
+        sys.exit()
 
     validate_input_dir(config)
 
@@ -914,22 +1088,13 @@ def check_input(config, args):
         required_drupal_fields = []
         for drupal_fieldname in field_definitions:
             # In the create task, we only check for required fields that apply to nodes.
-            if 'entity_type' in field_definitions[drupal_fieldname] and field_definitions[
-                    drupal_fieldname]['entity_type'] == 'node':
-                if 'required' in field_definitions[drupal_fieldname] and field_definitions[
-                        drupal_fieldname]['required'] is True:
+            if 'entity_type' in field_definitions[drupal_fieldname] and field_definitions[drupal_fieldname]['entity_type'] == 'node':
+                if 'required' in field_definitions[drupal_fieldname] and field_definitions[drupal_fieldname]['required'] is True:
                     required_drupal_fields.append(drupal_fieldname)
         for required_drupal_field in required_drupal_fields:
             if required_drupal_field not in csv_column_headers:
-                logging.error(
-                    "Required Drupal field %s is not present in the CSV file.",
-                    required_drupal_field)
-                sys.exit(
-                    'Error: Field "' +
-                    required_drupal_field +
-                    '" required for content type "' +
-                    config['content_type'] +
-                    '" is not present in the CSV file.')
+                logging.error("Required Drupal field %s is not present in the CSV file.", required_drupal_field)
+                sys.exit('Error: Field "' + required_drupal_field + '" required for content type "' + config['content_type'] + '" is not present in the CSV file.')
         message = 'OK, required Drupal fields are present in the CSV file.'
         print(message)
         logging.info(message)
@@ -980,13 +1145,8 @@ def check_input(config, args):
             if csv_column_header not in drupal_fieldnames and csv_column_header not in base_fields:
                 if csv_column_header in config['ignore_csv_columns']:
                     continue
-                logging.error(
-                    'CSV column header %s does not match any Drupal field names.',
-                    csv_column_header)
-                sys.exit(
-                    'Error: CSV column header "' +
-                    csv_column_header +
-                    '" does not match any Drupal field names.')
+                logging.error('CSV column header %s does not match any Drupal field names in the %s content type.', csv_column_header, config['content_type'])
+                sys.exit('Error: CSV column header "' + csv_column_header + '" does not match any Drupal field names in the ' + config['content_type'] + ' content type.')
         message = 'OK, CSV column headers match Drupal field names.'
         print(message)
         logging.info(message)
@@ -1032,12 +1192,39 @@ def check_input(config, args):
                     logging.warning(checksum_validation_message)
                     print("Warning: " + checksum_validation_message + " See the log for more detail.")
 
-    if config['task'] == 'update' or config['task'] == 'create':
+    if config['task'] == 'create_terms':
+        # Check that all required fields are present in the CSV.
+        field_definitions = get_field_definitions(config, 'taxonomy_term', config['vocab_id'])
+
+        # Check here that all required fields are present in the CSV.
+        required_fields = get_required_bundle_fields(config, 'taxonomy_term', config['vocab_id'])
+        required_fields.insert(0, 'term_name')
+        required_fields_check_csv_data = get_csv_data(config)
+        missing_fields = []
+        for required_field in required_fields:
+            if required_field not in required_fields_check_csv_data.fieldnames:
+                missing_fields.append(required_field)
+        if len(missing_fields) > 0:
+            message = 'Required columns missing from input CSV file: ' + joiner.join(missing_fields) + '.'
+            logging.error(message)
+            sys.exit('Error: ' + message)
+
+        # Validate length of 'term_name'.
+        validate_term_name_csv_data = get_csv_data(config)
+        for count, row in enumerate(validate_term_name_csv_data, start=1):
+            if 'term_name' in row and len(row['term_name']) > 255:
+                message = "The 'term_name' column in row for term '" + row['term_name'] + "' of your CSV file exceeds Drupal's maximum length of 255 characters."
+                logging.error(message)
+                sys.exit('Error: ' + message)
+
         validate_geolocation_values_csv_data = get_csv_data(config)
         validate_geolocation_fields(config, field_definitions, validate_geolocation_values_csv_data)
 
         validate_link_values_csv_data = get_csv_data(config)
         validate_link_fields(config, field_definitions, validate_link_values_csv_data)
+
+        validate_authority_link_values_csv_data = get_csv_data(config)
+        validate_authority_link_fields(config, field_definitions, validate_authority_link_values_csv_data)
 
         validate_edtf_values_csv_data = get_csv_data(config)
         validate_edtf_fields(config, field_definitions, validate_edtf_values_csv_data)
@@ -1053,34 +1240,40 @@ def check_input(config, args):
         if warn_user_about_taxo_terms is True:
             print('Warning: Issues detected with validating taxonomy field values in the CSV file. See the log for more detail.')
 
-        if 'vocab_csv' in config and len(config['vocab_csv']) > 0:
-            for vocab_csv_file in config['vocab_csv']:
-                for complex_vocab_id, complex_vocab_csv_file_path in vocab_csv_file.items():
-                    complex_vocab_exists = ping_vocabulary(config, complex_vocab_id)
-                    if complex_vocab_exists is False:
-                        message = 'Vocabulary "' + complex_vocab_id + '" specified in the "vocab_csv" setting does not exist.'
-                        logging.error(message)
-                        sys.exit('Error: ' + message)
-                    check_csv_file_exists(config, 'taxonomy_fields', complex_vocab_csv_file_path)
-                    validate_vocabulary_fields_in_csv(config, complex_vocab_id, complex_vocab_csv_file_path)
-
-                # validate_taxonomy_field_values(), above, checks whether vocab has required fields and if so,
-                # that they are present in the vocab CSV. @todo: Check the vocabulary CSV
-                # file to see if there is a corresponding row for the term.
-
         validate_typed_relation_csv_data = get_csv_data(config)
         warn_user_about_typed_relation_terms = validate_typed_relation_field_values(config, field_definitions, validate_typed_relation_csv_data)
         if warn_user_about_typed_relation_terms is True:
             print('Warning: Issues detected with validating typed relation field values in the CSV file. See the log for more detail.')
 
-        # Validate length of 'title'.
-        if config['validate_title_length']:
-            validate_title_csv_data = get_csv_data(config)
-            for count, row in enumerate(validate_title_csv_data, start=1):
-                if 'title' in row and len(row['title']) > 255:
-                    message = "The 'title' column in row " + str(count) + " of your CSV file exceeds Drupal's maximum length of 255 characters."
-                    logging.error(message)
-                    sys.exit('Error: ' + message)
+    if config['task'] == 'update' or config['task'] == 'create':
+        field_definitions = get_field_definitions(config, 'node')
+        validate_geolocation_values_csv_data = get_csv_data(config)
+        validate_geolocation_fields(config, field_definitions, validate_geolocation_values_csv_data)
+
+        validate_link_values_csv_data = get_csv_data(config)
+        validate_link_fields(config, field_definitions, validate_link_values_csv_data)
+
+        validate_authority_link_values_csv_data = get_csv_data(config)
+        validate_authority_link_fields(config, field_definitions, validate_authority_link_values_csv_data)
+
+        validate_edtf_values_csv_data = get_csv_data(config)
+        validate_edtf_fields(config, field_definitions, validate_edtf_values_csv_data)
+
+        validate_csv_field_cardinality_csv_data = get_csv_data(config)
+        validate_csv_field_cardinality(config, field_definitions, validate_csv_field_cardinality_csv_data)
+
+        validate_csv_field_length_csv_data = get_csv_data(config)
+        validate_csv_field_length(config, field_definitions, validate_csv_field_length_csv_data)
+
+        validate_taxonomy_field_csv_data = get_csv_data(config)
+        warn_user_about_taxo_terms = validate_taxonomy_field_values(config, field_definitions, validate_taxonomy_field_csv_data)
+        if warn_user_about_taxo_terms is True:
+            print('Warning: Issues detected with validating taxonomy field values in the CSV file. See the log for more detail.')
+
+        validate_typed_relation_csv_data = get_csv_data(config)
+        warn_user_about_typed_relation_terms = validate_typed_relation_field_values(config, field_definitions, validate_typed_relation_csv_data)
+        if warn_user_about_typed_relation_terms is True:
+            print('Warning: Issues detected with validating typed relation field values in the CSV file. See the log for more detail.')
 
         # Validate existence of nodes specified in 'field_member_of'. This could be generalized out to validate node IDs in other fields.
         # See https://github.com/mjordan/islandora_workbench/issues/90.
@@ -1092,8 +1285,9 @@ def check_input(config, args):
                     if len(parent_nid) > 0:
                         parent_node_exists = ping_node(config, parent_nid)
                         if parent_node_exists is False:
-                            message = "The 'field_member_of' field in row " + \
-                                str(count) + " of your CSV file contains a node ID (" + parent_nid + ") that doesn't exist."
+                            message = "The 'field_member_of' field in row with ID " + \
+                                row[config['id_field']] + " of your CSV file contains a node ID (" + parent_nid + ") that " + \
+                                    "doesn't exist or is not accessible. See the workbench log for more information."
                             logging.error(message)
                             sys.exit('Error: ' + message)
 
@@ -1103,7 +1297,7 @@ def check_input(config, args):
             for count, row in enumerate(validate_langcode_csv_data, start=1):
                 langcode_valid = validate_language_code(row['langcode'])
                 if not langcode_valid:
-                    message = "Row " + str(count) + " of your CSV file contains an invalid Drupal language code (" + row['langcode'] + ") in its 'langcode' column."
+                    message = "Row with ID " + row[config['id_field']] + " of your CSV file contains an invalid Drupal language code (" + row['langcode'] + ") in its 'langcode' column."
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -1126,69 +1320,70 @@ def check_input(config, args):
             message = 'For "delete_media" tasks, your CSV file must contain a "media_id" column.'
             logging.error(message)
             sys.exit('Error: ' + message)
+    if config['task'] == 'delete_media_by_node':
+        if 'node_id' not in csv_column_headers:
+            message = 'For "delete_media_by_node" tasks, your CSV file must contain a "node_id" column.'
+            logging.error(message)
+            sys.exit('Error: ' + message)
 
     # Check for existence of files listed in the 'file' column.
-    if (config['task'] == 'create' or config['task'] == 'add_media') and config['paged_content_from_directories'] is False:
+    if (config['task'] == 'create' or config['task'] == 'add_media') and config['nodes_only'] is False and config['paged_content_from_directories'] is False:
         file_check_csv_data = get_csv_data(config)
-        if config['nodes_only'] is False and config['allow_missing_files'] is False:
-            for count, file_check_row in enumerate(file_check_csv_data, start=1):
-                if len(file_check_row['file']) == 0:
-                    message = 'CSV row ' + file_check_row[config['id_field']] + ' contains an empty "file" value.'
-                    logging.error(message)
+        rows_with_missing_files = list()
+        for count, file_check_row in enumerate(file_check_csv_data, start=1):
+            file_check_row['file'] = file_check_row['file'].strip()
+            # Check for empty 'file' values.
+            if len(file_check_row['file']) == 0:
+                message = 'CSV row with ID ' + file_check_row[config['id_field']] + ' contains an empty "file" value.'
+                if config['exit_on_first_missing_file_during_check'] is True and config['allow_missing_files'] is False:
+                    logging.warning(message)
                     sys.exit('Error: ' + message)
-                file_check_row['file'] = file_check_row['file'].strip()
-                if file_check_row['file'].startswith('http'):
-                    http_response_code = ping_remote_file(config, file_check_row['file'])
-                    if http_response_code != 200 or ping_remote_file(config, file_check_row['file']) is False:
-                        message = 'Remote file ' + file_check_row['file'] + ' identified in CSV "file" column for record with ID field value ' \
-                            + file_check_row[config['id_field']] + ' not found or not accessible (HTTP response code ' + str(http_response_code) + ').'
+                else:
+                    if file_check_row[config['id_field']] not in rows_with_missing_files:
+                        rows_with_missing_files.append(file_check_row[config['id_field']])
+                        logging.error(message)
+            # Check for URLs.
+            elif file_check_row['file'].startswith('http'):
+                http_response_code = ping_remote_file(config, file_check_row['file'])
+                if http_response_code != 200 or ping_remote_file(config, file_check_row['file']) is False:
+                    message = 'Remote file "' + file_check_row['file'] + '" identified in CSV "file" column for record with ID "' \
+                        + file_check_row[config['id_field']] + '" not found or not accessible (HTTP response code ' + str(http_response_code) + ').'
+                    if config['exit_on_first_missing_file_during_check'] is True and config['allow_missing_files'] is False:
                         logging.error(message)
                         sys.exit('Error: ' + message)
+                    else:
+                        if file_check_row[config['id_field']] not in rows_with_missing_files:
+                            rows_with_missing_files.append(file_check_row[config['id_field']])
+                            logging.error(message)
+            # Check for files that cannot be found.
+            else:
                 if os.path.isabs(file_check_row['file']):
                     file_path = file_check_row['file']
                 else:
                     file_path = os.path.join(config['input_dir'], file_check_row['file'])
-                if not file_check_row['file'].startswith('http'):
-                    if not os.path.exists(file_path) or not os.path.isfile(file_path):
-                        message = 'File ' + file_path + ' identified in CSV "file" column for record with ID field value ' \
-                            + file_check_row[config['id_field']] + ' not found.'
+                if not os.path.exists(file_path) or not os.path.isfile(file_path):
+                    message = 'File "' + file_path + '" identified in CSV "file" column for record with ID field value "' \
+                        + file_check_row[config['id_field']] + '" not found.'
+                    if config['exit_on_first_missing_file_during_check'] is True:
                         logging.error(message)
                         sys.exit('Error: ' + message)
+                    else:
+                        if file_check_row[config['id_field']] not in rows_with_missing_files:
+                            rows_with_missing_files.append(file_check_row[config['id_field']])
+                            logging.error(message)
+
+        if len(rows_with_missing_files) > 0:
+            if config['allow_missing_files'] is False:
+                logging.error('Missing or empty CSV "file" column values detected. See log entries above.')
+                sys.exit('Error: Missing or empty CSV "file" column values detected. See the log for more information.')
+            else:
+                message = 'OK, missing or empty CSV "file" column values detected, but the "allow_missing_files" configuration option is enabled.'
+                print(message + " See the log for more information.")
+                logging.info(message + " See log entries above for more information.")
+        else:
             message = 'OK, files named in the CSV "file" column are all present.'
             print(message)
             logging.info(message)
-        empty_file_values_exist = False
-        if config['nodes_only'] is False and config['allow_missing_files'] is True:
-            for count, file_check_row in enumerate(file_check_csv_data, start=1):
-                file_check_row['file'] = file_check_row['file'].strip()
-                if len(file_check_row['file']) == 0:
-                    empty_file_values_exist = True
-                else:
-                    if file_check_row['file'].startswith('http'):
-                        http_response_code = ping_remote_file(config, file_check_row['file'])
-                        if http_response_code != 200 or ping_remote_file(config, file_check_row['file']) is False:
-                            message = 'Remote file ' + file_check_row['file'] + ' identified in CSV "file" column for record with ID field value "' \
-                                + file_check_row[config['id_field']] + '" not found or not accessible (HTTP response code ' + str(http_response_code) + ').'
-                            logging.error(message)
-                            sys.exit('Error: ' + message)
-                    else:
-                        if os.path.isabs(file_check_row['file']):
-                            file_path = file_check_row['file']
-                        else:
-                            file_path = os.path.join(config['input_dir'], file_check_row['file'])
-                        if not os.path.exists(file_path) or not os.path.isfile(file_path):
-                            message = 'File ' + file_path + ' identified in CSV "file" column for record with ID field value "' \
-                                + file_check_row[config['id_field']] + '" not found.'
-                            logging.error(message)
-                            sys.exit('Error: ' + message)
-            if empty_file_values_exist is True:
-                message = 'OK, files named in the CSV "file" column are all present; the "allow_missing_files" option is enabled and empty "file" values exist.'
-                print(message)
-                logging.info(message)
-            else:
-                message = 'OK, files named in the CSV "file" column are all present.'
-                print(message)
-                logging.info(message)
 
         # Verify that all media bundles/types exist.
         if config['nodes_only'] is False:
@@ -1242,7 +1437,7 @@ def check_input(config, args):
                         if file_check_row[additional_file_field].startswith('http'):
                             http_response_code = ping_remote_file(config, file_check_row[additional_file_field])
                             if http_response_code != 200 or ping_remote_file(config, file_check_row[additional_file_field]) is False:
-                                message = 'Remote file ' + file_check_row[additional_file_field] + ' identified in CSV "' + additional_file_field + '" column for record with ID field value ' \
+                                message = 'Remote file ' + file_check_row[additional_file_field] + ' identified in CSV "' + additional_file_field + '" column for record with ID ' \
                                     + file_check_row[config['id_field']] + ' not found or not accessible (HTTP response code ' + str(http_response_code) + ').'
                                 logging.error(message)
                                 sys.exit('Error: ' + message)
@@ -1252,7 +1447,7 @@ def check_input(config, args):
                             file_path = os.path.join(config['input_dir'], file_check_row[additional_file_field])
                         if not file_check_row[additional_file_field].startswith('http'):
                             if not os.path.exists(file_path) or not os.path.isfile(file_path):
-                                message = 'File ' + file_path + ' identified in CSV "' + additional_file_field + '" column for record with ID field value ' \
+                                message = 'File ' + file_path + ' identified in CSV "' + additional_file_field + '" column for record with ID ' \
                                     + file_check_row[config['id_field']] + ' not found.'
                                 logging.error(message)
                                 sys.exit('Error: ' + message)
@@ -1310,16 +1505,12 @@ def check_input(config, args):
                 sys.exit('Error: ' + message)
             page_files = os.listdir(dir_path)
             if len(page_files) == 0:
-                print(
-                    'Warning: Page directory ' +
-                    dir_path +
-                    ' is empty; is that intentional?')
-                logging.warning('Page directory ' + dir_path + ' is empty.')
+                message = 'Page directory ' + dir_path + ' is empty.'
+                print("Warning: " + message)
+                logging.warning(message)
             for page_file_name in page_files:
                 if config['paged_content_sequence_separator'] not in page_file_name:
-                    message = 'Page file ' + os.path.join(
-                        dir_path,
-                        page_file_name) + ' does not contain a sequence separator (' + config['paged_content_sequence_seprator'] + ').'
+                    message = 'Page file ' + os.path.join(dir_path, page_file_name) + ' does not contain a sequence separator (' + config['paged_content_sequence_separator'] + ').'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -1382,6 +1573,24 @@ def check_input(config, args):
                 logging.info(message)
                 print(message)
 
+    if config['task'] == 'export_csv':
+        if 'node_id' not in csv_column_headers:
+            message = 'For "export_csv" tasks, your CSV file must contain a "node_id" column.'
+            logging.error(message)
+            sys.exit('Error: ' + message)
+
+        export_csv_term_mode_options = ['tid', 'name']
+        if config['export_csv_term_mode'] not in export_csv_term_mode_options:
+            message = 'Configuration option "export_csv_term_mode_options" must be either "tid" or "name".'
+            logging.error(message)
+            sys.exit('Error: ' + message)
+
+        if config['export_csv_file_path'] is not None:
+            if not os.access(config['export_csv_file_path'], os.W_OK):
+                message = 'Path in configuration option "export_csv_file_path" ("' + config['export_csv_file_path'] + '") is not writable.'
+                logging.error(message)
+                sys.exit('Error: ' + message)
+
     # If nothing has failed by now, exit with a positive, upbeat message.
     print("Configuration and input data appear to be valid.")
     logging.info('Configuration checked for "%s" task using config file "%s", no problems found.', config['task'], args.config)
@@ -1392,7 +1601,11 @@ def check_input(config, args):
         for secondary_config_file in config['secondary_tasks']:
             print("")
             print('Running --check using secondary configuration file "' + secondary_config_file + '"')
-            cmd = ["./workbench", "--config", secondary_config_file, "--check"]
+            if os.name == 'nt':
+                # Assumes python.exe is in the user's PATH.
+                cmd = ["python", "./workbench", "--config", secondary_config_file, "--check"]
+            else:
+                cmd = ["./workbench", "--config", secondary_config_file, "--check"]
             output = subprocess.run(cmd)
 
         sys.exit(0)
@@ -1401,7 +1614,6 @@ def check_input(config, args):
 def get_registered_media_extensions(field_definitions):
     # Unfinished. See https://github.com/mjordan/islandora_workbench/issues/126.
     for field_name, field_def in field_definitions.items():
-        print("Field name: " + field_name + ' / ' + str(field_def))
         """
         print(field_def)
         if field_def['entity_type'] == 'media':
@@ -1430,14 +1642,13 @@ def check_input_for_create_from_files(config, args):
         'delimiter',
         'subdelimiter',
         'allow_missing_files',
-        'validate_title_length',
         'paged_content_from_directories',
         'delete_media_with_nodes',
         'allow_adding_terms']
     for option in unwanted_in_create_from_files:
         if option in config_keys:
             config_keys.remove(option)
-
+    joiner = ', '
     # Check for presence of required config keys.
     create_required_options = [
         'task',
@@ -1446,8 +1657,7 @@ def check_input_for_create_from_files(config, args):
         'password']
     for create_required_option in create_required_options:
         if create_required_option not in config_keys:
-            message = 'Please check your config file for required values: ' \
-                + joiner.join(create_options) + '.'
+            message = 'Please check your config file for required values: ' + joiner.join(create_required_options) + '.'
             logging.error(message)
             sys.exit('Error: ' + message)
 
@@ -1465,9 +1675,9 @@ def check_input_for_create_from_files(config, args):
     files = os.listdir(config['input_dir'])
     for file_name in files:
         filename_without_extension = os.path.splitext(file_name)[0]
-        if len(filename_without_extension) > 255:
+        if len(filename_without_extension) > int(config['max_node_title_length']):
             message = 'The filename "' + filename_without_extension + \
-                '" exceeds Drupal\'s maximum length of 255 characters and cannot be used for a node title.'
+                '" exceeds Drupal\'s maximum length of ' + config['max_node_title_length'] + ' characters and cannot be used for a node title.'
             logging.error(message)
             sys.exit('Error: ' + message)
 
@@ -1493,8 +1703,7 @@ def log_field_cardinality_violation(field_name, record_id, cardinality):
        configured id_field or a node ID.
     """
     logging.warning(
-        "Adding all values in CSV field %s for record %s would exceed maximum " +
-        "number of allowed values (%s), so only adding first value.",
+        "Adding all values in CSV field %s for record %s would exceed maximum number of allowed values (%s). Skipping adding extra values.",
         field_name,
         record_id,
         cardinality)
@@ -1518,15 +1727,15 @@ def validate_language_code(langcode):
 
 
 def clean_csv_values(row):
-    """Performs basic string cleanup on CSV values. Could be used in the future for
-       other normalization tasks.
+    """Performs basic string cleanup on CSV values.
     """
     for field in row:
-        # Strip leading and trailing whitespace.
-        row[field] = str(row[field]).strip()
         # Replace smart/curly quotes with straight ones.
         row[field] = row[field].replace('“', '"').replace('”', '"')
         row[field] = row[field].replace("‘", "'").replace("’", "'")
+
+        # Strip leading and trailing whitespace.
+        row[field] = str(row[field]).strip()
     return row
 
 
@@ -1586,13 +1795,15 @@ def split_typed_relation_string(config, typed_relation_string, target_type):
        e.g., 'relators:pht:5'. 'id' is either a term ID or a node ID. This
        function takes one of those strings (optionally with a multivalue
        subdelimiter) and returns a list of dictionaries in the form they
-       take in existing node values.
+       take in existing node values. ID values can also be term names (strings)
+       and term URIs (also strings, but in the form 'http....').
 
        Also, these values can (but don't need to) have an optional namespace
        in the term ID segment, which is the vocabulary ID string. These
        typed relation strings look like 'relators:pht:person:Jordan, Mark'.
        However, since we split the typed relation strings only on the first
-       two :, we don't need to worry about what's in the third segment.
+       two :, the entire third segment is considered, for the purposes of
+       splitting the value, to be the term.
     """
     return_list = []
     temp_list = typed_relation_string.split(config['subdelimiter'])
@@ -1652,6 +1863,29 @@ def split_link_string(config, link_string):
     return return_list
 
 
+def split_authority_link_string(config, authority_link_string):
+    """Fields of type 'authority_link' are represented in the CSV file using a structured string,
+       specifically source%%uri%%title, e.g. "viaf%%http://viaf.org/viaf/153525475%%Rush (Musical group)".
+       This function takes one of those strings (optionally with a multivalue subdelimiter)
+       and returns a list of dictionaries with 'source', 'uri' and 'title' keys required by the
+       'authority_link' field type.
+    """
+    return_list = []
+    temp_list = authority_link_string.split(config['subdelimiter'])
+    for item in temp_list:
+        if item.count('%%') == 2:
+            item_list = item.split('%%', 2)
+            item_dict = {'source': item_list[0].strip(), 'uri': item_list[1].strip(), 'title': item_list[2].strip()}
+            return_list.append(item_dict)
+        if item.count('%%') == 1:
+            # There is no title.
+            item_list = item.split('%%', 1)
+            item_dict = {'source': item_list[0].strip(), 'uri': item_list[1].strip(), 'title': ''}
+            return_list.append(item_dict)
+
+    return return_list
+
+
 def validate_media_use_tid_in_additional_files_setting(config, media_use_tid_value, additional_field_name):
     """Validate whether the term ID registered in the "additional_files" config setting
        is in the Islandora Media Use vocabulary.
@@ -1685,9 +1919,14 @@ def validate_media_use_tid_in_additional_files_setting(config, media_use_tid_val
                     logging.error(message)
                     sys.exit('Error: ' + message)
             if 'field_external_uri' in response_body:
-                if response_body['field_external_uri'][0]['uri'] != 'http://pcdm.org/use#OriginalFile':
+                if len(response_body['field_external_uri']) > 0 and response_body['field_external_uri'][0]['uri'] != 'http://pcdm.org/use#OriginalFile':
                     message = 'Warning: Term ID "' + str(media_use_tid) + '" registered in the "additional_files" config option ' + \
-                        'for field "' + additional_field_name + '" will assign an Islandora Media Use term that might ' + \
+                        'for CSV field "' + additional_field_name + '" will assign an Islandora Media Use term that might ' + \
+                        "conflict with derivative media. You should temporarily disable the Context or Action that generates those derivatives."
+                else:
+                    # There is no field_external_uri so we can't identify the term. Provide a generic message.
+                    message = 'Warning: Terms registered in the "additional_files" config option ' + \
+                        'for CSV field "' + additional_field_name + '" may assign an Islandora Media Use term that will ' + \
                         "conflict with derivative media. You should temporarily disable the Context or Action that generates those derivatives."
                     print(message)
                     logging.warning(message)
@@ -2003,7 +2242,7 @@ def create_media(config, filename, file_fieldname, node_id, node_csv_row, media_
         media_type = set_media_type(config, filename, file_fieldname, node_csv_row)
         media_bundle_response_code = ping_media_bundle(config, media_type)
         if media_bundle_response_code == 404:
-            message = 'File "' + file_check_row[filename_field] + '" identified in CSV row ' + file_check_row[config['id_field']] + \
+            message = 'File "' + filename + '" identified in CSV row ' + file_fieldname + \
                 ' will create a media of type (' + media_type + '), but that media type is not configured in the destination Drupal.'
             logging.error(message)
             return False
@@ -2128,7 +2367,7 @@ def create_islandora_media(config, filename, file_fieldname, node_uri, node_csv_
     media_type = set_media_type(config, filename, file_fieldname, node_csv_row)
     media_bundle_response_code = ping_media_bundle(config, media_type)
     if media_bundle_response_code == 404:
-        message = 'File "' + file_check_row[filename_field] + '" identified in CSV row ' + file_check_row[config['id_field']] + \
+        message = 'File "' + filename + '" identified in CSV row ' + file_fieldname + \
             ' will create a media of type (' + media_type + '), but that media type is not configured in the destination Drupal.'
         logging.error(message)
         return False
@@ -2219,13 +2458,13 @@ def patch_media_fields(config, media_id, media_type, node_csv_row):
             media_json['uid'] = [{'target_id': field_value}]
 
     if len(media_json) > 1:
-        endpoint = config['host'] + '/media/' + media_id + '?_format=json'
+        endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
         headers = {'Content-Type': 'application/json'}
         response = issue_request(config, 'PATCH', endpoint, headers, media_json)
         if response.status_code == 200:
-            logging.info("Media %s fields updated to match parent node's.", config['host'] + '/media/' + media_id)
+            logging.info("Media %s fields updated to match parent node's.", config['host'] + '/media/' + media_id + '/edit')
         else:
-            logging.warning("Media %s fields not updated to match parent node's.", config['host'] + '/media/' + media_id)
+            logging.warning("Media %s fields not updated to match parent node's.", config['host'] + '/media/' + media_id + '/edit')
 
 
 def patch_media_use_terms(config, media_id, media_type, media_use_tids):
@@ -2242,13 +2481,13 @@ def patch_media_use_terms(config, media_id, media_type, media_use_tids):
         media_use_tids_json.append({'target_id': media_use_tid, 'target_type': 'taxonomy_term'})
 
     media_json['field_media_use'] = media_use_tids_json
-    endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+    endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
     headers = {'Content-Type': 'application/json'}
     response = issue_request(config, 'PATCH', endpoint, headers, media_json)
     if response.status_code == 200:
-        logging.info("Media %s Islandora Media Use terms updated.", config['host'] + '/media/' + str(media_id))
+        logging.info("Media %s Islandora Media Use terms updated.", config['host'] + '/media/' + str(media_id) + '/edit')
     else:
-        logging.warning("Media %s Islandora Media Use terms not updated.", config['host'] + '/media/' + str(media_id))
+        logging.warning("Media %s Islandora Media Use terms not updated.", config['host'] + '/media/' + str(media_id) + '/edit')
 
 
 def clean_image_alt_text(input_string):
@@ -2262,7 +2501,7 @@ def patch_image_alt_text(config, media_id, node_csv_row):
     """Patch the alt text value for an image media. Use the parent node's title
        unless the CSV record contains an image_alt_text field with something in it.
     """
-    get_endpoint = config['host'] + '/media/' + media_id + '?_format=json'
+    get_endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
     get_headers = {'Content-Type': 'application/json'}
     get_response = issue_request(config, 'GET', get_endpoint, get_headers)
     get_response_body = json.loads(get_response.text)
@@ -2283,7 +2522,7 @@ def patch_image_alt_text(config, media_id, node_csv_row):
         ],
     }
 
-    patch_endpoint = config['host'] + '/media/' + media_id + '?_format=json'
+    patch_endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
     patch_headers = {'Content-Type': 'application/json'}
     patch_response = issue_request(
         config,
@@ -2293,20 +2532,24 @@ def patch_image_alt_text(config, media_id, node_csv_row):
         media_json)
 
     if patch_response.status_code != 200:
-        logging.warning(
-            "Alt text for image media %s not updated.",
-            config['host'] + '/media/' + media_id)
+        logging.warning("Alt text for image media %s not updated.", config['host'] + '/media/' + media_id + + '/edit')
 
 
 def remove_media_and_file(config, media_id):
     """Delete a media and the file associated with it.
     """
     # First get the media JSON.
-    get_media_url = '/media/' + str(media_id) + '?_format=json'
+    get_media_url = '/media/' + str(media_id) + '/edit?_format=json'
     get_media_response = issue_request(config, 'GET', get_media_url)
     get_media_response_body = json.loads(get_media_response.text)
 
-    # These are the Drupal field names on the various types of media.
+    # See https://github.com/mjordan/islandora_workbench/issues/446 for background.
+    if 'message' in get_media_response_body and get_media_response_body['message'].startswith("No route found for"):
+        message = f'Please visit {config["host"]}/admin/config/media/media-settings and uncheck the "Standalone media URL" option.'
+        logging.error(message)
+        sys.exit("Error: " + message)
+
+    # These are the Drupal field names on the standard types of media.
     file_fields = [
         'field_media_file',
         'field_media_image',
@@ -2324,24 +2567,17 @@ def remove_media_and_file(config, media_id):
     if file_response.status_code == 204:
         logging.info("File %s (from media %s) deleted.", file_id, media_id)
     else:
-        logging.error(
-            "File %s (from media %s) not deleted (HTTP response code %s).",
-            file_id,
-            media_id,
-            file_response.status_code)
+        logging.error("File %s (from media %s) not deleted (HTTP response code %s).", file_id, media_id, file_response.status_code)
 
     # Then the media.
     if file_response.status_code == 204:
-        media_endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+        media_endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
         media_response = issue_request(config, 'DELETE', media_endpoint)
         if media_response.status_code == 204:
             logging.info("Media %s deleted.", media_id)
             return media_response.status_code
         else:
-            logging.error(
-                "Media %s not deleted (HTTP response code %s).",
-                media_id,
-                media_response.status_code)
+            logging.error("Media %s not deleted (HTTP response code %s).", media_id, media_response.status_code)
             return False
 
     return False
@@ -2489,7 +2725,7 @@ def get_csv_data(config, csv_file_target='node_fields', file_path=None):
                     sys.exit('Error: ' + message)
 
     csv_writer_file_handle.close()
-    preprocessed_csv_reader_file_handle = open(input_csv_path + '.prepocessed', 'r')
+    preprocessed_csv_reader_file_handle = open(input_csv_path + '.prepocessed', 'r', encoding='utf-8')
     preprocessed_csv_reader = csv.DictReader(preprocessed_csv_reader_file_handle, delimiter=config['delimiter'], restval='stringtopopulateextrafields')
     return preprocessed_csv_reader
 
@@ -2577,6 +2813,19 @@ def get_term_vocab(config, term_id):
         return False
 
 
+def get_term_name(config, term_id):
+    """Get the term's and return it. If the term doesn't exist, return False.
+    """
+    url = config['host'] + '/taxonomy/term/' + str(term_id).strip() + '?_format=json'
+    response = issue_request(config, 'GET', url)
+    if response.status_code == 200:
+        term_data = json.loads(response.text)
+        return term_data['name'][0]['value']
+    else:
+        logging.warning('Query for term ID "%s" returned a %s status code', term_id, response.status_code)
+        return False
+
+
 def get_term_id_from_uri(config, uri):
     """For a given URI, query the Term from URI View created by the Islandora
        Workbench Integration module. Because we don't know which field each
@@ -2635,18 +2884,30 @@ def get_term_id_from_uri(config, uri):
     return False
 
 
-def create_term(config, vocab_id, term_name):
+def create_term(config, vocab_id, term_name, term_csv_row=None):
     """Adds a term to the target vocabulary. Returns the new term's ID
        if successful (or if the term already exists) or False if not.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        vocab_id: string
+            The vocabulary ID.
+        term_name: string
+            The term name from CSV.
+        term_csv_row: OrderedDict
+            ECSV row containing term field data. Only present if we are creating
+            complex or child terms, not present for simple terms.
+        Returns
+        -------
+        string|boolean
+            The term ID, or False term was not created.
     """
     # Check to see if term exists; if so, return its ID, if not, proceed to create it.
     tid = find_term_in_vocab(config, vocab_id, term_name)
     if value_is_numeric(tid):
-        logging.info(
-            'Term "%s" (term ID %s) already exists in vocabulary "%s".',
-            term_name,
-            tid,
-            vocab_id)
+        logging.info('Term "%s" (term ID %s) already exists in vocabulary "%s".', term_name, tid, vocab_id)
         return tid
 
     if config['allow_adding_terms'] is False:
@@ -2660,12 +2921,13 @@ def create_term(config, vocab_id, term_name):
         logging.info(message + message_2)
         term_name = truncated_term_name
 
-    term_field_data = get_term_field_data(config, vocab_id, term_name)
+    term_field_data = get_term_field_data(config, vocab_id, term_name, term_csv_row)
     if term_field_data is False:
-        # @todo: complete this warning message. Details should be logged in get_term_field_data().
-        logging.warning('Unable to create term "' + term_name + '" because.....')
+        # @todo: Failure details should be logged in get_term_field_data().
+        logging.warning('Unable to create term "' + term_name + '" because Workbench could not get term field data.')
         return False
 
+    # Common values for all terms, simple and complex.
     term = {
         "vid": [
            {
@@ -2684,33 +2946,20 @@ def create_term(config, vocab_id, term_name):
 
     term_endpoint = config['host'] + '/taxonomy/term?_format=json'
     headers = {'Content-Type': 'application/json'}
-    response = issue_request(
-        config,
-        'POST',
-        term_endpoint,
-        headers,
-        term,
-        None)
+    response = issue_request(config, 'POST', term_endpoint, headers, term, None)
     if response.status_code == 201:
         term_response_body = json.loads(response.text)
         tid = term_response_body['tid'][0]['value']
-        logging.info(
-            'Term %s ("%s") added to vocabulary "%s".',
-            tid,
-            term_name,
-            vocab_id)
+        logging.info('Term %s ("%s") added to vocabulary "%s".', tid, term_name, vocab_id)
         newly_created_term_name_for_matching = term_name.lower().strip()
         newly_created_terms.append({'tid': tid, 'vocab_id': vocab_id, 'name': term_name, 'name_for_matching': newly_created_term_name_for_matching})
         return tid
     else:
-        logging.warning(
-            "Term '%s' not created, HTTP response code was %s.",
-            term_name,
-            response.status_code)
+        logging.warning("Term '%s' not created, HTTP response code was %s.", term_name, response.status_code)
         return False
 
 
-def get_term_field_data(config, vocab_id, term_name):
+def get_term_field_data(config, vocab_id, term_name, term_csv_row):
     """Assemble the dict that will be added to the 'term' dict in create_term(). status, description,
        weight, parent, default_langcode, path fields are added here, even for simple term_name-only
        terms. Check the vocabulary CSV file to see if there is a corresponding row. If the vocabulary
@@ -2724,135 +2973,141 @@ def get_term_field_data(config, vocab_id, term_name):
             The vocabulary ID.
         term_name: string
             The term name from CSV.
+        term_csv_row: OrderedDict
+            ECSV row containing term field data.
         Returns
         -------
         dict|boolean
             The dict containing the term field data, or False if this is not possible.
             @note: reason why creating JSON is not possible should be logged in this function.
     """
-    # Get any registered vocabulary CSV files.
-    if 'vocab_csv' in config and len(config['vocab_csv']) > 0:
-        csv_vocabs = list()
-        csv_vocab_id_path_pairs = dict()
-        for vocab_file_entry in config['vocab_csv']:
-            for key, path in vocab_file_entry.items():
-                csv_vocabs.append(key)
-                csv_vocab_id_path_pairs[key] = path
+    # 'vid' and 'name' are added in create_term().
+    term_field_data = {
+        "status": [
+            {
+                "value": True
+            }
+        ],
+        "description": [
+            {
+                "value": "",
+                "format": None
+            }
+        ],
+        "weight": [
+            {
+                "value": 0
+            }
+        ],
+        "parent": [
+            {
+                "target_type": "taxonomy_term",
+                "target_id": None
+            }
+        ],
+        "default_langcode": [
+            {
+                "value": True
+            }
+        ],
+        "path": [
+            {
+                "alias": None,
+                "pid": None,
+                "langcode": "en"
+            }
+        ]
+    }
 
-    # No vocabulary CSV in use for the current vocabulary.
-    if 'vocab_csv' not in config or ('vocab_csv' in config and vocab_id not in csv_vocabs):
-        term_field_data = {
-            "status": [
-                {
-                    "value": True
-                }
-            ],
-            "description": [
-                {
-                    "value": "",
-                    "format": None
-                }
-            ],
-            "weight": [
-                {
-                    "value": 0
-                }
-            ],
-            "parent": [
-                {
-                    "target_id": None
-                }
-            ],
-            "default_langcode": [
-                {
-                    "value": True
-                }
-            ],
-            "path": [
-                {
-                    "alias": None,
-                    "pid": None,
-                    "langcode": "en"
-                }
-            ]
-        }
+    # We're creating a simple term, with only a term name.
+    if term_csv_row is None:
         return term_field_data
+    # We're creating a complex term, with extra fields.
     else:
-        # Vocabulary CSVs in use.
-        vocab_csv_file_path = csv_vocab_id_path_pairs[vocab_id.strip()].strip()
-        vocab_csv_data = get_csv_data(config, 'taxonomy_fields', vocab_csv_file_path)
-        vocab_csv_column_headers = vocab_csv_data.fieldnames
-        # Check to see if the vocabulary has any required fields; if any of them are absent, log error and return.
+        # Importing the workbench_fields module at the top of this module with the
+        # rest of the imports causes a circular import exception, so we do it here.
+        import workbench_fields
+
         vocab_field_definitions = get_field_definitions(config, 'taxonomy_term', vocab_id.strip())
-        for vocab_column_name in vocab_csv_column_headers:
-            # Check that 'term_name' and 'parent' are in the CSV.
-            if 'term_name' not in vocab_csv_column_headers:
-                message = 'Required column "term_name" not found in vocabulary CSV file "' + vocab_csv_file_path + '".'
-                logging.error(message)
-                sys.exit('Error: ' + message)
-            if 'parent' not in vocab_csv_column_headers:
-                message = 'Required column "parent" not found in vocabulary CSV file "' + vocab_csv_file_path + '".'
-                logging.error(message)
-                sys.exit('Error: ' + message)
-            # Then check for required fields.
-            some_required_fields = False
-            vocab_field_definition_fieldnames = vocab_field_definitions.keys()
-            for vocab_field in vocab_field_definition_fieldnames:
-                if vocab_field_definitions[field]['required'] is True:
-                    some_required_vocab_fields = True
-                    if field not in vocab_csv_data.fieldnames:
-                        message = 'Required column "' + field + '" not found in vocabulary CSV file "' + vocab_csv_file_path + '".'
-                        logging.error(message)
-                        sys.exit('Error: ' + message)
 
-        # Check the vocabulary CSV file to see if there is a corresponding row for the term. We also perform this
-        # in validate_taxonomy_field_values() and validate_typed_relation_field_values().
-        for count, row in enumerate(vocab_csv_data, start=1):
-            required_matching_rows = check_matching_vocabulary_csv_row(term_name, vocab_csv_data)
-            if some_required_fields is True:
-                if required_matching_rows == 0:
-                    # Error out because there are required fields
-                    message = 'Term "' + term_name + '" not found in vocabulary CSV file "' + vocab_csv_file_path + '".'
-                    logging.error(message)
-                    sys.exit('Error: ' + message)
-                elif required_matching_rows > 1:
-                    # Error out because there should only be one matching row (since we only create new terms once).
-                    message = 'Term "' + term_name + '" has ' + str(required_matching_rows) + ' matching rows in vocabulary CSV file "' + \
-                        vocab_csv_file_path + '". There should only be one matching row.'
-                    logging.error(message)
-                    sys.exit('Error: ' + message)
+        # Build the JSON from the CSV row and create the term.
+        vocab_csv_column_headers = term_csv_row.keys()
+        for field_name in vocab_csv_column_headers:
+            # term_name is the "id" field in the vocabulary CSV and not a field in the term JSON, so skip it.
+            if field_name == 'term_name':
+                continue
+
+            # 'parent' field is present and not empty, so we need to look up the parent term. All terms
+            # that are parents will have already been created back in workbench.create_terms() as long as
+            # they preceded the children. If they come after the children in the CSV, we create the child
+            # term anyway but log that the parent could not be found.
+            if 'parent' in term_csv_row and len(term_csv_row['parent'].strip()) != 0:
+                parent_tid = find_term_in_vocab(config, vocab_id, term_csv_row['parent'])
+                if value_is_numeric(parent_tid):
+                    term_field_data['parent'][0]['target_id'] = str(parent_tid)
                 else:
-                    # @todo: build the JSON from the CSV row and create term.
-                    pass
+                    # Create the term, but log that its parent could not be found.
+                    message = 'Term "' + term_csv_row['term_name'] + '" added to vocabulary "' + vocab_id + '", but without its parent "' + \
+                        term_csv_row['parent'] + '", which isn\'t present in that vocabulary (possibly hasn\'t been create yet?).'
+                    logging.warning(message)
 
+            # 'parent' is not a field added to the term JSON in the field handlers, so skip it.
+            if field_name == 'parent':
+                continue
 
-def check_matching_vocabulary_csv_row(term_name, vocabulary_csv_data):
-    """If the vocabulary CSV data contains required fields, each new term in the node CSV
-       needs to have a corresponding row in the vocabulary CSV, otherwise Workbench can't
-       create the new term since required field data for that term is missing. This function
-       checks whether a there is a matching row in the vocabulary CSV for a given term name.
-       It returns the number of matches in the vocab CSV (so the caller can check whether
-       there's more than one, which we generally don't want).
+            # Set 'description' and 'weight' JSON values if there are corresponding columns in the CSV.
+            if 'weight' in term_csv_row and len(term_csv_row['weight'].strip()) != 0:
+                if value_is_numeric(term_csv_row['weight']):
+                    term_field_data['weight'][0]['value'] = str(term_csv_row['weight'])
+                else:
+                    # Create the term, but log that its weight could not be populated.
+                    message = 'Term "' + term_csv_row['term_name'] + '" added to vocabulary "' + vocab_id + '", but without its weight "' + \
+                        term_csv_row['weight'] + '", which must be an integer.'
+                    logging.warning(message)
 
-       NOTE TO MJ: this should be called both during --check and during ingest.
-    """
-    """Parameters
-        ----------
-        term_name: string
-            The term name from CSV.
-        vocabulary_csv_data : DictReader
-            The entire CSV data from the vocabulary CSV file (i.e., throwaway copy of the CSV data).
-        Returns
-        -------
-        int
-            Number of matches.
-    """
-    matches = list()
-    for count, row in enumerate(vocabulary_csv_data, start=1):
-        if term_name.strip() == row['term_name'].strip():
-            matches.append(True)
+            # 'weight' is not a field added to the term JSON in the field handlers, so skip it.
+            if field_name == 'weight':
+                continue
 
-    return len(matches)
+            if 'description' in term_csv_row and len(term_csv_row['description'].strip()) != 0:
+                term_field_data['description'][0]['value'] = term_csv_row['description']
+
+            # 'description' is not a field added to the term JSON in the field handlers, so skip it.
+            if field_name == 'description':
+                continue
+
+            # Assemble additional Drupal field structures for entity reference fields from CSV data.
+            # Entity reference fields (taxonomy_term and node)
+            if vocab_field_definitions[field_name]['field_type'] == 'entity_reference':
+                entity_reference_field = workbench_fields.EntityReferenceField()
+                term_field_data = entity_reference_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+            # Typed relation fields.
+            elif vocab_field_definitions[field_name]['field_type'] == 'typed_relation':
+                typed_relation_field = workbench_fields.TypedRelationField()
+                term_field_data = typed_relation_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+            # Geolocation fields.
+            elif vocab_field_definitions[field_name]['field_type'] == 'geolocation':
+                geolocation_field = workbench_fields.GeolocationField()
+                term_field_data = geolocation_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+            # Link fields.
+            elif vocab_field_definitions[field_name]['field_type'] == 'link':
+                link_field = workbench_fields.LinkField()
+                term_field_data = link_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+            # Authority Link fields.
+            elif vocab_field_definitions[field_name]['field_type'] == 'authority_link':
+                authority_link_field = workbench_fields.AuthorityLinkField()
+                term_field_data = authority_link_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+            # For non-entity reference and non-typed relation fields (text, integer, boolean etc.).
+            else:
+                simple_field = workbench_fields.SimpleField()
+                term_field_data = simple_field.create(config, vocab_field_definitions, term_field_data, term_csv_row, field_name)
+
+        return term_field_data
 
 
 def get_term_uuid(config, term_id):
@@ -2915,11 +3170,9 @@ def prepare_term_id(config, vocab_ids, term):
     else:
         if len(vocab_ids) == 1:
             # A namespace is not needed since this vocabulary is the only one linked to
-            # its field, but since there is only one vocab_id, we prepend it here so that
-            # term names that contain a : are parsed properly.
+            # its field, so we remove it before sending it to create_term().
             namespaced = re.search(':', term)
             if namespaced:
-                term = vocab_ids[0] + ':' + term
                 [vocab_id, term_name] = term.split(':', maxsplit=1)
                 tid = create_term(config, vocab_id.strip(), term_name.strip())
                 return tid
@@ -2927,7 +3180,7 @@ def prepare_term_id(config, vocab_ids, term):
                 tid = create_term(config, vocab_ids[0].strip(), term.strip())
                 return tid
         else:
-            # Term names used in mult-taxonomy fields. They need to be namespaced with
+            # Term names used in multi-taxonomy fields. They need to be namespaced with
             # the taxonomy ID.
             #
             # If the field has more than one vocabulary linked to it, we don't know which
@@ -3073,16 +3326,14 @@ def validate_csv_field_length(config, field_definitions, csv_data):
         if csv_header in field_definitions.keys():
             if 'max_length' in field_definitions[csv_header]:
                 max_length = field_definitions[csv_header]['max_length']
-                # We don't care about max_length of None (i.e., it's
-                # not applicable or unlimited).
+                # We don't care about max_length of None (i.e., it's not applicable or unlimited).
                 if max_length is not None:
                     field_max_lengths[csv_header] = max_length
 
     for count, row in enumerate(csv_data, start=1):
         for field_name in field_max_lengths.keys():
             if field_name in row:
-                delimited_field_values = row[field_name].split(
-                    config['subdelimiter'])
+                delimited_field_values = row[field_name].split(config['subdelimiter'])
                 for field_value in delimited_field_values:
                     field_value_length = len(field_value)
                     if field_name in field_max_lengths and len(field_value) > int(field_max_lengths[field_name]):
@@ -3111,7 +3362,7 @@ def validate_geolocation_fields(config, field_definitions, csv_data):
                     for field_value in delimited_field_values:
                         if len(field_value.strip()):
                             if not validate_latlong_value(field_value.strip()):
-                                message = 'Value in field "' + field_name + '" in row ' + str(count) + ' (' + field_value + ') is not a valid lat,long pair.'
+                                message = 'Value in field "' + field_name + '" in row with ID ' + row[config['id_field']] + ' (' + field_value + ') is not a valid lat,long pair.'
                                 logging.error(message)
                                 sys.exit('Error: ' + message)
 
@@ -3134,13 +3385,38 @@ def validate_link_fields(config, field_definitions, csv_data):
                     for field_value in delimited_field_values:
                         if len(field_value.strip()):
                             if not validate_link_value(field_value.strip()):
-                                message = 'Value in field "' + field_name + '" in row ' + str(count) + \
-                                    ' (' + field_value + ') is not a valid link field value.'
+                                message = 'Value in field "' + field_name + '" in row with ID ' + row[config['id_field']] + ' (' + field_value + ') is not a valid link field value.'
                                 logging.error(message)
                                 sys.exit('Error: ' + message)
 
     if link_fields_present is True:
         message = "OK, link field values in the CSV file validate."
+        print(message)
+        logging.info(message)
+
+
+def validate_authority_link_fields(config, field_definitions, csv_data):
+    """Validate values in fields that are of type 'authority_link'.
+    """
+    if config['task'] == 'create_terms':
+        config['id_field'] = 'term_name'
+
+    authority_link_fields_present = False
+    for count, row in enumerate(csv_data, start=1):
+        for field_name in field_definitions.keys():
+            if field_definitions[field_name]['field_type'] == 'authority_link':
+                if field_name in row:
+                    authority_link_fields_present = True
+                    delimited_field_values = row[field_name].split(config['subdelimiter'])
+                    for field_value in delimited_field_values:
+                        if len(field_value.strip()):
+                            if not validate_authority_link_value(field_value.strip(), field_definitions[field_name]['authority_sources']):
+                                message = 'Value in field "' + field_name + '" in row with ID "' + row[config['id_field']] + '" (' + field_value + ') is not a valid authority link field value.'
+                                logging.error(message)
+                                sys.exit('Error: ' + message)
+
+    if authority_link_fields_present is True:
+        message = "OK, authority link field values in the CSV file validate."
         print(message)
         logging.info(message)
 
@@ -3174,6 +3450,30 @@ def validate_link_value(link_value):
         return False
 
 
+def validate_authority_link_value(authority_link_value, authority_sources):
+    """Validates that the value in 'authority_link_value' has a 'source' and that the URI
+       component starts with either 'http://' or 'https://'.
+    """
+    """Parameters
+        ----------
+        authority_link_value : string
+            The authority link string, with a sourcea, URI, and optionally a title.
+        authority_sources : list
+            The list of authority sources (e.g. lcsh, cash, viaf, etc.) configured for the field.
+        Returns
+        -------
+        boolean
+            True if it does, False if not.
+    """
+    parts = authority_link_value.split('%%', 2)
+    if parts[0] not in authority_sources:
+        return False
+    if re.match(r"^https?://", parts[1]):
+        return True
+    else:
+        return False
+
+
 def validate_term_name_length(term_name, row_number, column_name):
     """Checks that the length of a term name does not exceed
        Drupal's 255 character length.
@@ -3197,8 +3497,8 @@ def validate_node_created_date(csv_data):
             if field_name == 'created' and len(field_value) > 0:
                 # matches = re.match(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$', field_value)
                 if not validate_node_created_date_string(field_value):
-                    message = 'CSV field "created" in record ' + \
-                        str(count) + ' contains a date "' + field_value + '" that is not formatted properly.'
+                    message = 'CSV field "created" in record with ID ' + \
+                        row[config['id_field']] + ' contains a date "' + field_value + '" that is not formatted properly.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -3208,8 +3508,8 @@ def validate_node_created_date(csv_data):
                     r'[+-]\d\d:\d\d$', '', field_value)
                 created_date = datetime.datetime.strptime(date_string_trimmed, '%Y-%m-%dT%H:%M:%S')
                 if created_date > now:
-                    message = 'CSV field "created" in record ' + \
-                        str(count) + ' contains a date "' + field_value + '" that is in the future.'
+                    message = 'CSV field "created" in record with ID ' + \
+                        row[config['id_field']] + ' contains a date "' + field_value + '" that is in the future.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -3239,7 +3539,7 @@ def validate_edtf_fields(config, field_definitions, csv_data):
                         if len(field_value.strip()):
                             valid = validate_edtf_date(field_value)
                             if valid is False:
-                                message = 'Value in field "' + field_name + '" in row ' + str(count) + ' ("' + field_value + '") is not a valid EDTF date/time.'
+                                message = 'Value in field "' + field_name + '" in row with ID ' + row[config['id_field']] + ' ("' + field_value + '") is not a valid EDTF date/time.'
                                 logging.error(message)
                                 sys.exit('Error: ' + message)
 
@@ -3261,16 +3561,16 @@ def validate_url_aliases(config, csv_data):
         for field_name, field_value in row.items():
             if field_name == 'url_alias' and len(field_value) > 0:
                 if field_value.strip()[0] != '/':
-                    message = 'CSV field "url_alias" in record ' + \
-                        str(count) + ' contains an alias "' + field_value + '" that is missing its leading /.'
+                    message = 'CSV field "url_alias" in record with ID ' + \
+                        row[config['id_field']] + ' contains an alias "' + field_value + '" that is missing its leading /.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
                 alias_ping = ping_url_alias(config, field_value)
                 # @todo: Add 301 and 302 as acceptable status codes?
                 if alias_ping == 200:
-                    message = 'CSV field "url_alias" in record ' + \
-                        str(count) + ' contains an alias "' + field_value + '" that already exists.'
+                    message = 'CSV field "url_alias" in record with ID ' + \
+                        row[config['id_field']] + ' contains an alias "' + field_value + '" that already exists.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -3291,8 +3591,8 @@ def validate_node_uid(config, csv_data):
                 uid_url = config['host'] + '/user/' + str(field_value) + '?_format=json'
                 uid_response = issue_request(config, 'GET', uid_url)
                 if uid_response.status_code == 404:
-                    message = 'CSV field "uid" in record ' + \
-                        str(count) + ' contains a user ID "' + field_value + '" that does not exist in the target Drupal.'
+                    message = 'CSV field "uid" in record with ID ' + \
+                        row[config['id_field']] + ' contains a user ID "' + field_value + '" that does not exist in the target Drupal.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
 
@@ -3323,61 +3623,9 @@ def validate_taxonomy_field_values(config, field_definitions, csv_data):
                 try:
                     num_vocabs = len(vocabularies)
                 except BaseException:
-                    message = 'Workbench cannot get vocabularies linked to field "' + \
-                        column_name + '". Please confirm that field has at least one vocabulary.'
+                    message = 'Workbench cannot get vocabularies linked to field "' + column_name + '". Please confirm that field has at least one vocabulary.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
-
-                for vocabulary in vocabularies:
-                    if column_name not in fields_with_vocabularies:
-                        fields_with_vocabularies.append(column_name)
-                    # Check whether the vocabulary has any required fields, and if so, that the
-                    # vocab has an entry in config['vocab_csv'].
-                    vocab_field_definitions = get_field_definitions(config, 'taxonomy_term', vocabulary.strip())
-                    required_fields_in_vocab = list()
-                    for vocab_field in vocab_field_definitions:
-                        if vocab_field != 'term_name' and vocab_field_definitions[vocab_field]['required'] is True:
-                            required_fields_in_vocab.append(vocab_field)
-
-                    if 'vocab_csv' not in config:
-                        if len(required_fields_in_vocab) > 0:
-                            required_fields_string = ', '.join(required_fields_in_vocab)
-                            message = 'Vocabulary "' + vocabulary + '" has requied fields (' + required_fields_string + \
-                                ') so you must include the "vocab_csv" setting in your configuration, and include a column ' + \
-                                "for those fields in the vocabulary's CSV."
-                            logging.error(message)
-                            sys.exit('Error: ' + message)
-                    else:
-                        if len(config['vocab_csv']) > 0:
-                            if len(required_fields_in_vocab) > 0:
-                                csv_vocabs_paths = get_vocabs_csv_paths(config)
-                                csv_vocabs = csv_vocabs_paths.keys()
-                                if vocabulary not in csv_vocabs:
-                                    required_fields_string = ', '.join(required_fields_in_vocab)
-                                    message = 'Vocabulary "' + vocabulary + '" has requied fields (' + required_fields_string + \
-                                        ') but is not included in the "vocab_csv" configuration setting.'
-                                    logging.error(message)
-                                    sys.exit('Error: ' + message)
-
-                                ''' <- WIP on #111.
-                                vvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-                                vocab_csv_data = get_csv_data(config, 'taxonomy_fields', complex_vocab_csv_file_path)
-                                for count, row in enumerate(vocab_csv_data, start=1):
-                                    required_matching_rows = check_matching_vocabulary_csv_row(term_name, vocab_csv_data)
-                                    if some_required_fields is True:
-                                        if required_matching_rows == 0:
-                                            # Error out because there are required fields
-                                            message = 'Term "' + term_name + '" not found in vocabulary CSV file "' + vocab_csv_file_path + '".'
-                                            logging.error(message)
-                                            sys.exit('Error: ' + message)
-                                        elif required_matching_rows > 1:
-                                            # Error out because there should only be one matching row (since we only create new terms once).
-                                            message = 'Term "' + term_name + '" has ' + str(required_matching_rows) + ' matching rows in vocabulary CSV file "' + \
-                                                vocab_csv_file_path + '". There should only be one matching row.'
-                                            logging.error(message)
-                                            sys.exit('Error: ' + message)
-                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                                '''
 
     # If none of the CSV fields are taxonomy reference fields, return.
     if len(fields_with_vocabularies) == 0:
@@ -3435,14 +3683,14 @@ def validate_vocabulary_fields_in_csv(config, vocabulary_id, vocab_csv_file_path
             else:
                 field_count += 1
         if extra_headers is True:
-            message = "Row " + str(count) + ' (ID ' + row[config['id_field']] + ') of the vocabulary CSV file "' + \
+            message = "Row with ID " + row[config['id_field']] + ') of the vocabulary CSV file "' + \
                 vocab_csv_file_path + '" has fewer columns than there are headers (' + str(len(csv_column_headers)) + ")."
             logging.error(message)
             sys.exit('Error: ' + message)
         # Note: this message is also generated in get_csv_data() since CSV Writer thows an exception if the row has
         # form fields than headers.
         if len(csv_column_headers) < field_count:
-            message = "Row " + str(count) + " (ID " + row['term_name'] + ') of the vocabulary CSV file "' + vocab_csv_file_path + \
+            message = "Row with term name '" + row['term_name'] + ') of the vocabulary CSV file "' + vocab_csv_file_path + \
                 '" has more columns (' + str(field_count) + ") than there are headers (" + str(len(csv_column_headers)) + ")."
             logging.error(message)
             sys.exit('Error: ' + message)
@@ -3504,43 +3752,10 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
                 try:
                     num_vocabs = len(vocabularies)
                 except BaseException:
-                    message = 'Workbench cannot get vocabularies linked to field "' + \
-                        column_name + '". Please confirm that field has at least one vocabulary.'
+                    message = 'Workbench cannot get vocabularies linked to field "' + column_name + '". Please confirm that field has at least one vocabulary.'
                     logging.error(message)
                     sys.exit('Error: ' + message)
                 all_tids_for_field = []
-                for vocabulary in vocabularies:
-                    if column_name not in fields_with_vocabularies:
-                        fields_with_vocabularies.append(column_name)
-                    # Check whether the vocabulary has any required fields, and if so, that the
-                    # vocab has an entry in config['vocab_csv'].
-                    vocab_field_definitions = get_field_definitions(config, 'taxonomy_term', vocabulary.strip())
-                    required_fields_in_vocab = list()
-                    for vocab_field in vocab_field_definitions:
-                        if vocab_field != 'term_name' and vocab_field_definitions[vocab_field]['required'] is True:
-                            required_fields_in_vocab.append(vocab_field)
-
-                    if 'vocab_csv' not in config:
-                        if len(required_fields_in_vocab) > 0:
-                            required_fields_string = ', '.join(required_fields_in_vocab)
-                            message = 'Vocabulary "' + vocabulary + '" has requied fields (' + required_fields_string + \
-                                ') but the "vocab_csv" configuration setting is not present.'
-                            logging.error(message)
-                            sys.exit('Error: ' + message)
-                    else:
-                        if len(config['vocab_csv']) > 0:
-                            if len(required_fields_in_vocab) > 0:
-                                csv_vocabs_paths = get_vocabs_csv_paths(config)
-                                csv_vocabs = csv_vocabs_paths.keys()
-                                for vocab_file_entry in config['vocab_csv']:
-                                    for key, item in vocab_file_entry.items():
-                                        csv_vocabs.append(key)
-                                if vocabulary not in csv_vocabs:
-                                    required_fields_string = ', '.join(required_fields_in_vocab)
-                                    message = 'Vocabulary "' + vocabulary + '" has requied fields (' + required_fields_string + \
-                                        ') but is not included in the "vocab_csv" configuration setting.'
-                                    logging.error(message)
-                                    sys.exit('Error: ' + message)
 
     # If none of the CSV fields are taxonomy reference fields, return.
     if len(fields_with_vocabularies) == 0:
@@ -3559,7 +3774,7 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
                             continue
                         # First check the required patterns.
                         if not re.match("^[a-zA-Z]+:[a-zA-Z]+:.+$", field_value.strip()):
-                            message = 'Value in field "' + field_name + '" in row ' + str(count) + \
+                            message = 'Value in field "' + field_name + '" in row with ID ' + row[config['id_field']] + \
                                 ' (' + field_value + ') does not use the pattern required for typed relation fields.'
                             logging.error(message)
                             sys.exit('Error: ' + message)
@@ -3569,7 +3784,7 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
                         typed_relation_value_parts = field_value.split(':', 2)
                         relator_string = typed_relation_value_parts[0] + ':' + typed_relation_value_parts[1]
                         if relator_string not in field_definitions[field_name]['typed_relations']:
-                            message = 'Value in field "' + field_name + '" in row ' + str(count) + \
+                            message = 'Value in field "' + field_name + '" in row with ID ' + row[config['id_field']] + \
                                 ' contains a relator (' + relator_string + ') that is not configured for that field.'
                             logging.error(message)
                             sys.exit('Error: ' + message)
@@ -3621,15 +3836,14 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                     # the vocabulary IDs referenced by this field.
                     field_value_parts = field_value.split(':')
                     if field_value_parts[0] not in this_fields_vocabularies:
-                        message = 'Vocabulary ID ' + field_value_parts[0] + \
-                            ' used in CSV column "' + csv_field_name + '", row ' + str(record_number) + \
+                        message = 'Vocabulary ID "' + field_value_parts[0] + \
+                            '" used in CSV column "' + csv_field_name + '", row ' + str(record_number) + \
                             ' does not match any of the vocabularies referenced by the' + \
                             ' corresponding Drupal field (' + this_fields_vocabularies_string + ').'
                         logging.error(message)
                         sys.exit('Error: ' + message)
                 else:
-                    message = 'Term names in multi-vocabulary CSV field "' + \
-                        csv_field_name + '" require a vocabulary namespace; value '
+                    message = 'Term names in multi-vocabulary CSV field "' + csv_field_name + '" require a vocabulary namespace; value '
                     message_2 = '"' + field_value + '" in row ' \
                         + str(record_number) + ' does not have one.'
                     logging.error(message + message_2)
@@ -3647,8 +3861,7 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                 if term_vocab == vocab_id:
                     term_in_vocabs = True
             if term_in_vocabs is False:
-                message = 'CSV field "' + csv_field_name + '" in row ' + \
-                    str(record_number) + ' contains a term ID (' + field_value + ') that is '
+                message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a term ID (' + field_value + ') that is '
                 if len(this_fields_vocabularies) > 1:
                     message_2 = 'not in one of the referenced vocabularies (' + \
                         this_fields_vocabularies_string + ').'
@@ -3668,19 +3881,15 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                     if term_vocab == vocab_id:
                         term_in_vocabs = True
                 if term_in_vocabs is False:
-                    message = 'CSV field "' + csv_field_name + '" in row ' + \
-                        str(record_number) + ' contains a term URI (' + field_value + ') that is '
+                    message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a term URI (' + field_value + ') that is '
                     if len(this_fields_vocabularies) > 1:
-                        message_2 = 'not in one of the referenced vocabularies (' \
-                            + this_fields_vocabularies_string + ').'
+                        message_2 = 'not in one of the referenced vocabularies (' + this_fields_vocabularies_string + ').'
                     else:
-                        message_2 = 'not in the referenced vocabulary ("' \
-                            + this_fields_vocabularies[0] + '").'
+                        message_2 = 'not in the referenced vocabulary ("' + this_fields_vocabularies[0] + '").'
                     logging.error(message + message_2)
                     sys.exit('Error: ' + message + message_2)
             else:
-                message = 'Term URI "' + field_value + '" used in CSV column "' + \
-                    csv_field_name + '" row ' + str(record_number) + ' does not match any terms.'
+                message = 'Term URI "' + field_value + '" used in CSV column "' + csv_field_name + '" row ' + str(record_number) + ' does not match any terms.'
                 logging.error(message)
                 sys.exit('Error: ' + message)
         # Finally, check values that are string term names.
@@ -3696,10 +3905,8 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                             if tid is False:
                                 new_term_names_in_csv = True
                                 validate_term_name_length(field_value, str(record_number), csv_field_name)
-                                message = 'CSV field "' + csv_field_name + '" in row ' + \
-                                    str(record_number) + ' contains a term ("' + field_value.strip() + '") that is '
-                                message_2 = 'not in the referenced vocabulary ("' + \
-                                    this_fields_vocabularies[0] + '"). That term will be created.'
+                                message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a term ("' + field_value.strip() + '") that is '
+                                message_2 = 'not in the referenced vocabulary ("' + this_fields_vocabularies[0] + '"). That term will be created.'
                                 if config['validate_terms_exist'] is True:
                                     logging.warning(message + message_2)
                         else:
@@ -3719,8 +3926,7 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                         # Check to see if the namespaced vocab is referenced by this field.
                         [namespace_vocab_id, namespaced_term_name] = split_field_value.split(':', 1)
                         if namespace_vocab_id not in this_fields_vocabularies:
-                            message = 'CSV field "' + csv_field_name + '" in row ' + \
-                                str(record_number) + ' contains a namespaced term name '
+                            message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a namespaced term name '
                             message_2 = '(' + namespaced_term_name.strip() + '") that specifies a vocabulary not associated with that field.'
                             logging.error(message + message_2)
                             sys.exit('Error: ' + message + message_2)
@@ -3731,10 +3937,8 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                         if config['allow_adding_terms'] is True:
                             if tid is False and split_field_value not in new_terms_to_add:
                                 new_term_names_in_csv = True
-                                message = 'CSV field "' + csv_field_name + '" in row ' + \
-                                    str(record_number) + ' contains a term ("' + namespaced_term_name.strip() + '") that is '
-                                message_2 = 'not in the referenced vocabulary ("' + \
-                                    namespace_vocab_id + '"). That term will be created.'
+                                message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a term ("' + namespaced_term_name.strip() + '") that is '
+                                message_2 = 'not in the referenced vocabulary ("' + namespace_vocab_id + '"). That term will be created.'
                                 if config['validate_terms_exist'] is True:
                                     logging.warning(message + message_2)
                                 new_terms_to_add.append(split_field_value)
@@ -3743,10 +3947,8 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                         # Die if namespaced term name is not specified vocab.
                         else:
                             if tid is False:
-                                message = 'CSV field "' + csv_field_name + '" in row ' + \
-                                    str(record_number) + ' contains a term ("' + namespaced_term_name.strip() + '") that is '
-                                message_2 = 'not in the referenced vocabulary ("' + \
-                                    namespace_vocab_id + '").'
+                                message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a term ("' + namespaced_term_name.strip() + '") that is '
+                                message_2 = 'not in the referenced vocabulary ("' + namespace_vocab_id + '").'
                                 logging.warning(message + message_2)
                                 sys.exit('Error: ' + message + message_2)
 
@@ -3885,13 +4087,7 @@ def create_children_from_directory(config, parent_csv_record, parent_node_id, pa
             'Content-Type': 'application/json'
         }
         node_endpoint = '/node?_format=json'
-        node_response = issue_request(
-            config,
-            'POST',
-            node_endpoint,
-            node_headers,
-            node_json,
-            None)
+        node_response = issue_request(config, 'POST', node_endpoint, node_headers, node_json, None)
         if node_response.status_code == 201:
             node_uri = node_response.headers['location']
             print('+ Node for child "' + page_title + '" created at ' + node_uri + '.')
@@ -4219,6 +4415,45 @@ def get_prepocessed_file_path(config, file_fieldname, node_csv_row, node_id=None
         return file_path
 
 
+def get_node_media_ids(config, node_id, media_use_tids=[]):
+    """Gets a list of media IDs for a node.
+    """
+
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        node_id : string
+            The ID of the node to delete media from.
+        media_use_tids : list
+            Term IDs from the Islandora Media Use vocabulary. If present, media
+            with one of these tids will be added to the returned list of media IDs.
+            If empty, all media will be included in the returned list of media IDs.
+        Returns
+        -------
+        list
+            List of media IDs.
+    """
+    media_id_list = list()
+    url = f"{config['host']}/node/{node_id}/media?_format=json"
+    response = issue_request(config, 'GET', url)
+    if response.status_code == 200:
+        body = json.loads(response.text)
+        for media in body:
+            if len(media_use_tids) == 0:
+                media_id_list.append(media['mid'][0]['value'])
+            else:
+                for media_use_tid_json in media['field_media_use']:
+                    if media_use_tid_json['target_id'] in media_use_tids:
+                        media_id_list.append(media['mid'][0]['value'])
+        return media_id_list
+    else:
+        message = f'Attempt to get media for node ID {node_id} returned a {response.status_code} status code.'
+        print("Error: " + message)
+        logging.warning(message)
+        return False
+
+
 def download_remote_file(config, url, file_fieldname, node_csv_row, node_id):
     sections = urllib.parse.urlparse(url)
     try:
@@ -4353,7 +4588,6 @@ def check_csv_file_exists(config, csv_file_target, file_path=None):
         if os.path.isabs(file_path):
             input_csv = file_path
             '''
-            <- because python
             # For Google Sheets, the "extraction" is fired over in workbench.
             elif config['input_csv'].startswith('http'):
                 input_csv = os.path.join(config['input_dir'], config['google_sheets_csv_filename'])
@@ -4378,29 +4612,6 @@ def check_csv_file_exists(config, csv_file_target, file_path=None):
             message = 'Vocabulary CSV file ' + input_csv + ' not found.'
             logging.error(message)
             sys.exit('Error: ' + message)
-
-
-def get_vocabs_csv_paths(config):
-    """Converts the 'vocab_csv' config setting value into a dict for easy access.
-    """
-    """Parameters
-        ----------
-        config : dict
-            The configuration object defined by set_config_defaults().
-        Returns
-        -------
-        dict
-            A dictionary of vocab ID/file path pairs, or False if the
-            config setting is absent or empty.
-    """
-    if 'vocab_csv' in config and len(config['vocab_csv']) > 0:
-        csv_vocab_id_path_pairs = dict()
-        for vocab_file_entry in config['vocab_csv']:
-            for key, path in vocab_file_entry.items():
-                csv_vocab_id_path_pairs[key] = path
-        return csv_vocab_id_path_pairs
-    else:
-        return False
 
 
 def get_csv_template(config, args):
@@ -4516,6 +4727,56 @@ def get_csv_template(config, args):
     sys.exit()
 
 
+def serialize_field_json(config, field_definitions, field_name, field_data):
+    """Serializes JSON from a Drupal field into a string consistent with Workbench's CSV-field input format.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        field_definitions : dict
+            The field definitions object defined by get_field_definitions().
+        field_name : string
+            The Drupal fieldname/CSV column header.
+        field_data : string
+            Raw JSON from the field named 'field_name'.
+        Returns
+        -------
+        string
+            A string structured same as the Workbench CSV field data for the field type.
+    """
+    # Importing the workbench_fields module at the top of this module with the
+    # rest of the imports causes a circular import exception, so we do it here.
+    import workbench_fields
+
+    # Entity reference fields (taxonomy term and node).
+    if field_definitions[field_name]['field_type'] == 'entity_reference':
+        serialized_field = workbench_fields.EntityReferenceField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+    # Typed relation fields (currently, only taxonomy term)
+    elif field_definitions[field_name]['field_type'] == 'typed_relation':
+        serialized_field = workbench_fields.TypedRelationField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+    # Geolocation fields.
+    elif field_definitions[field_name]['field_type'] == 'geolocation':
+        serialized_field = workbench_fields.GeolocationField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+    # Link fields.
+    elif field_definitions[field_name]['field_type'] == 'link':
+        serialized_field = workbench_fields.LinkField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+    # Authority Link fields.
+    elif field_definitions[field_name]['field_type'] == 'authority_link':
+        serialized_field = workbench_fields.AuthorityLinkField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+    # Simple fields.
+    else:
+        serialized_field = workbench_fields.SimpleField()
+        csv_field_data = serialized_field.serialize(config, field_definitions, field_name, field_data)
+
+    return csv_field_data
+
+
 def prep_node_ids_tsv(config):
     path_to_tsv_file = os.path.join(config['input_dir'], config['secondary_tasks_data_file'])
     if os.path.exists(path_to_tsv_file):
@@ -4563,6 +4824,30 @@ def read_node_ids_tsv(config):
 
 def get_percentage(part, whole):
     return 100 * float(part) / float(whole)
+
+
+def calculate_response_time_trend(config, response_time):
+    """Gets the average response time from the most recent 20 HTTP requests.
+    """
+    """Parameters
+        ----------
+        response_time : Response time of current request, in seconds.
+            The string to test.
+        Returns
+        -------
+        int|None
+            The average response time of the most recent 20 requests.
+    """
+    http_response_times.append(response_time)
+    if len(http_response_times) > 20:
+        sample = http_response_times[-20:]
+    else:
+        sample = http_response_times
+    if config['log_response_time_sample'] is True:
+        logging.info("Response time trend sample: %s", sample)
+    if len(sample) > 0:
+        average = sum(sample) / len(sample)
+        return average
 
 
 def is_ascii(input):
