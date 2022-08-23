@@ -226,9 +226,13 @@ def issue_request(
             config['log_response_time'] = True
 
     if config['log_response_time'] is True:
-        url_for_logging = urllib.parse.urlparse(url).path + '?' + urllib.parse.urlparse(url).query
+        parsed_query_string = urllib.parse.urlparse(url).query
+        if len(parsed_query_string):
+            url_for_logging = urllib.parse.urlparse(url).path + '?' + parsed_query_string
+        else:
+            url_for_logging = urllib.parse.urlparse(url).path
         if 'adaptive_pause' in config and value_is_numeric(config['adaptive_pause']):
-            response_time - int(config['adaptive_pause'])
+            response_time = response_time - int(config['adaptive_pause'])
         response_time_trend_entry = {'method': method, 'response': response.status_code, 'url': url_for_logging, 'response_time': response_time, 'average_response_time': average_response_time}
         logging.info(response_time_trend_entry)
         # Set this config option back to what it was before we updated in above.
@@ -385,8 +389,7 @@ def ping_node(config, nid, method='HEAD', return_json=False):
         else:
             return True
     else:
-        logging.warning(
-            "Node ping (%s) on %s returned a %s status code", method.upper(), url, response.status_code)
+        logging.warning("Node ping (%s) on %s returned a %s status code", method.upper(), url, response.status_code)
         return False
 
 
@@ -406,10 +409,7 @@ def ping_vocabulary(config, vocab_id):
     if response.status_code == 200:
         return True
     else:
-        logging.warning(
-            "Node ping (HEAD) on %s returned a %s status code",
-            url,
-            response.status_code)
+        logging.warning("Node ping (HEAD) on %s returned a %s status code", url, response.status_code)
         return False
 
 
@@ -464,8 +464,62 @@ def ping_content_type(config):
     return issue_request(config, 'GET', url).status_code
 
 
-def ping_view_path(config, view_url):
+def ping_view_entpoint(config, view_url):
+    """Verifies that the View REST endpoint is accessible.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        view_url
+            The View's REST export path.
+        Returns
+        -------
+        int
+            The HTTP response code.
+    """
     return issue_request(config, 'HEAD', view_url).status_code
+
+
+def ping_entity_reference_view_endpoint(config, fieldname, hander_settings):
+    """Verifies that the REST endpoint of the View is accessible. The path to this endpoint
+       is defined in the configuration file's 'entity_reference_view_endpoints' option.
+
+       Necessary for entity reference fields configured as "Views: Filter by an entity reference View".
+       Unlike Views endpoints for taxonomy entity reference fields configured using the "default"
+       entity reference method, the Islandora Workbench Integration module does not provide a generic
+       Views REST endpoint that can be used to validate values in this type of field.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        fieldname: string
+            The name of the Drupal field.
+        handler_settings : dict
+            The handler_settings values from the field's configuration.
+            # handler_settings': {'view': {'view_name': 'mj_entity_reference_test', 'display_name': 'entity_reference_1', 'arguments': []}}
+        Returns
+        -------
+        bool
+            True if the REST endpoint is accessible, False if not.
+    """
+    endpoint_mappings = get_entity_reference_view_endpoints(config)
+    if len(endpoint_mappings) == 0:
+        logging.warning("The 'entity_reference_view_endpoints' option in your configuration file does not contain any field-Views endpoint mappings.")
+        return False
+    if fieldname not in endpoint_mappings:
+        logging.warning('The field "' + fieldname + '" is not in your "entity_reference_view_endpoints" configuration option.')
+        return False
+
+    # "http://localhost:8000/issue_452_test?name=xxx&_format=json"
+    url = config['host'] + endpoint_mappings[fieldname] + '?name=xxx&_format=json'
+    response = issue_request(config, 'GET', url)
+    if response.status_code == 200:
+        return True
+    else:
+        logging.warning("View REST export ping (HEAD) on %s returned a %s status code", url, response.status_code)
+        return False
 
 
 def ping_media_bundle(config, bundle_name):
@@ -591,6 +645,7 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             field_definitions[fieldname] = {}
             raw_field_config = get_entity_field_config(config, fieldname, entity_type, bundle_type)
             field_config = json.loads(raw_field_config)
+
             field_definitions[fieldname]['entity_type'] = field_config['entity_type']
             field_definitions[fieldname]['required'] = field_config['required']
             field_definitions[fieldname]['label'] = field_config['label']
@@ -598,6 +653,15 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             if len(raw_vocabularies) > 0:
                 vocabularies = [x.replace("taxonomy.vocabulary.", '') for x in raw_vocabularies]
                 field_definitions[fieldname]['vocabularies'] = vocabularies
+            # Reference 'handler' could be nothing, 'default:taxonomy_term' (or some other entity type), or 'views'.
+            if 'handler' in field_config['settings']:
+                field_definitions[fieldname]['handler'] = field_config['settings']['handler']
+            else:
+                field_definitions[fieldname]['handler'] = None
+            if 'handler_settings' in field_config['settings']:
+                field_definitions[fieldname]['handler_settings'] = field_config['settings']['handler_settings']
+            else:
+                field_definitions[fieldname]['handler_settings'] = None
 
             raw_field_storage = get_entity_field_storage(config, fieldname, entity_type)
             field_storage = json.loads(raw_field_storage)
@@ -618,7 +682,19 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             else:
                 field_definitions[fieldname]['authority_sources'] = None
 
-        field_definitions['title'] = {'entity_type': 'node', 'required': True, 'label': 'Title', 'field_type': 'string', 'cardinality': 1, 'max_length': config['max_node_title_length'], 'target_type': None}
+        # title's configuration is not returned by Drupal so we construct it here. Note: if you add a new key to
+        # 'field_definitions', also add it to title's entry here. Also add it for 'title' in the other entity types, below.
+        field_definitions['title'] = {
+            'entity_type': 'node',
+            'required': True,
+            'label': 'Title',
+            'field_type': 'string',
+            'cardinality': 1,
+            'max_length': config['max_node_title_length'],
+            'target_type': None,
+            'handler': None,
+            'handler_settings': None
+        }
 
     if entity_type == 'taxonomy_term':
         fields = get_entity_fields(config, 'taxonomy_term', bundle_type)
@@ -629,6 +705,16 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             field_definitions[fieldname]['entity_type'] = field_config['entity_type']
             field_definitions[fieldname]['required'] = field_config['required']
             field_definitions[fieldname]['label'] = field_config['label']
+            # Reference 'handler' could be nothing, 'default:taxonomy_term' (or some other entity type), or 'views'.
+            if 'handler' in field_config['settings']:
+                field_definitions[fieldname]['handler'] = field_config['settings']['handler']
+            else:
+                field_definitions[fieldname]['handler'] = None
+            if 'handler_settings' in field_config['settings']:
+                field_definitions[fieldname]['handler_settings'] = field_config['settings']['handler_settings']
+            else:
+                field_definitions[fieldname]['handler_settings'] = None
+
             raw_field_storage = get_entity_field_storage(config, fieldname, entity_type)
             field_storage = json.loads(raw_field_storage)
             field_definitions[fieldname]['field_type'] = field_storage['type']
@@ -646,7 +732,17 @@ def get_field_definitions(config, entity_type, bundle_type=None):
             else:
                 field_definitions[fieldname]['authority_sources'] = None
 
-        field_definitions['term_name'] = {'entity_type': 'taxonomy_term', 'required': True, 'label': 'Name', 'field_type': 'string', 'cardinality': 1, 'max_length': 255, 'target_type': None}
+        field_definitions['term_name'] = {
+            'entity_type': 'taxonomy_term',
+            'required': True,
+            'label': 'Name',
+            'field_type': 'string',
+            'cardinality': 1,
+            'max_length': 255,
+            'target_type': None,
+            'handler': None,
+            'handler_settings': None
+        }
 
     if entity_type == 'media':
         # @note: this section is incomplete.
@@ -927,7 +1023,7 @@ def check_input(config, args):
     if config['task'] == 'get_data_from_view':
         # First, ping the View.
         view_url = config['host'] + '/' + config['view_path'].lstrip('/')
-        view_path_status_code = ping_view_path(config, view_url)
+        view_path_status_code = ping_view_endpoint(config, view_url)
         if view_path_status_code != 200:
             message = f"Cannot access View at {view_url}."
             logging.error(message)
@@ -1064,6 +1160,21 @@ def check_input(config, args):
             langcode_was_present = True
 
         for csv_column_header in csv_column_headers:
+            # Check for the View that is necessary for entity reference fields configured
+            # as "Views: Filter by an entity reference View" (issue 452).
+            if field_definitions[csv_column_header]['handler'] == 'views':
+                entity_reference_view_exists = ping_entity_reference_view_endpoint(config, csv_column_header, field_definitions[csv_column_header]['handler_settings'])
+                if entity_reference_view_exists is False:
+                    # handler_settings: {'view': {'view_name': 'mj_entity_reference_test', 'display_name': 'entity_reference_1', 'arguments': []}}
+                    console_message = 'Workbench cannot access the View "' + field_definitions[csv_column_header]['handler_settings']['view']['view_name'] + \
+                        '" required to validate values for field "' + csv_column_header + '". See log for more detail.'
+                    log_message = 'Workbench cannot access the path defined by the REST Export display "' + \
+                        field_definitions[csv_column_header]['handler_settings']['view']['display_name'] + \
+                        '" in the View "' + field_definitions[csv_column_header]['handler_settings']['view']['view_name'] + \
+                        '" required to validate values for field "' + csv_column_header + '". Please check your Drupal Views configuration.'
+                    logging.error(log_message)
+                    sys.exit('Error: ' + console_message)
+
             if len(get_additional_files_config(config)) > 0:
                 if csv_column_header not in drupal_fieldnames and csv_column_header not in base_fields and csv_column_header not in get_additional_files_config(config).keys():
                     if csv_column_header in config['ignore_csv_columns']:
@@ -1285,9 +1396,9 @@ def check_input(config, args):
                     if len(parent_nid) > 0:
                         parent_node_exists = ping_node(config, parent_nid)
                         if parent_node_exists is False:
-                            message = "The 'field_member_of' field in row with ID " + \
-                                row[config['id_field']] + " of your CSV file contains a node ID (" + parent_nid + ") that " + \
-                                    "doesn't exist or is not accessible. See the workbench log for more information."
+                            message = "The 'field_member_of' field in row with ID " + row[config['id_field']] + \
+                                " of your CSV file contains a node ID (" + parent_nid + ") that " + \
+                                "doesn't exist or is not accessible. See the workbench log for more information."
                             logging.error(message)
                             sys.exit('Error: ' + message)
 
@@ -1531,6 +1642,24 @@ def check_input(config, args):
                 sys.exit('Error: ' + message)
         if bootsrap_scripts_present is True:
             message = "OK, registered bootstrap scripts found and executable."
+            logging.info(message)
+            print(message)
+
+    # Check for shutdown scripts, if any are configured.
+    shutdown_scripts_present = False
+    if 'shutdown' in config and len(config['shutdown']) > 0:
+        shutdown_scripts_present = True
+        for shutdown_script in config['shutdown']:
+            if not os.path.exists(shutdown_script):
+                message = "shutdown script " + shutdown_script + " not found."
+                logging.error(message)
+                sys.exit('Error: ' + message)
+            if os.access(shutdown_script, os.X_OK) is False:
+                message = "Shutdown script " + shutdown_script + " is not executable."
+                logging.error(message)
+                sys.exit('Error: ' + message)
+        if shutdown_scripts_present is True:
+            message = "OK, registered shutdown scripts found and executable."
             logging.info(message)
             print(message)
 
@@ -2068,6 +2197,15 @@ def execute_bootstrap_script(path_to_script, path_to_config_file):
     return result, cmd.returncode
 
 
+def execute_shutdown_script(path_to_script, path_to_config_file):
+    """Executes a shutdown script and returns its output and exit status code.
+    """
+    cmd = subprocess.Popen([path_to_script, path_to_config_file], stdout=subprocess.PIPE)
+    result, stderrdata = cmd.communicate()
+
+    return result, cmd.returncode
+
+
 def execute_entity_post_task_script(path_to_script, path_to_config_file, http_response_code, entity_json=''):
     """Executes a entity-level post-task script and returns its output and exit status code.
     """
@@ -2178,7 +2316,12 @@ def create_file(config, filename, file_fieldname, node_csv_row, node_id):
                                         config['fixity_algorithm'], file_path, node_csv_row[config['id_field']], hash_from_local, node_csv_row['checksum'])
             if is_remote and config['delete_tmp_upload'] is True:
                 containing_folder = os.path.join(config['input_dir'], re.sub('[^A-Za-z0-9]+', '_', node_csv_row[config['id_field']]))
-                shutil.rmtree(containing_folder)
+                try:
+                    # E.g., on Windows, "[WinError 32] The process cannot access the file because it is being used by another process"
+                    shutil.rmtree(containing_folder)
+                except PermissionError as e:
+                    logging.error(e)
+
             return file_id
         else:
             logging.error('File not created, POST request to "%s" returned an HTTP status code of "%s".', file_endpoint_path, file_response.status_code)
@@ -2458,13 +2601,16 @@ def patch_media_fields(config, media_id, media_type, node_csv_row):
             media_json['uid'] = [{'target_id': field_value}]
 
     if len(media_json) > 1:
-        endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
+        if config['standalone_media_url'] is True:
+            endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+        else:
+            endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
         headers = {'Content-Type': 'application/json'}
         response = issue_request(config, 'PATCH', endpoint, headers, media_json)
         if response.status_code == 200:
-            logging.info("Media %s fields updated to match parent node's.", config['host'] + '/media/' + media_id + '/edit')
+            logging.info("Media %s fields updated to match parent node's.", endpoint)
         else:
-            logging.warning("Media %s fields not updated to match parent node's.", config['host'] + '/media/' + media_id + '/edit')
+            logging.warning("Media %s fields not updated to match parent node's.", endpoint)
 
 
 def patch_media_use_terms(config, media_id, media_type, media_use_tids):
@@ -2481,13 +2627,16 @@ def patch_media_use_terms(config, media_id, media_type, media_use_tids):
         media_use_tids_json.append({'target_id': media_use_tid, 'target_type': 'taxonomy_term'})
 
     media_json['field_media_use'] = media_use_tids_json
-    endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
+    if config['standalone_media_url'] is True:
+        endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+    else:
+        endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
     headers = {'Content-Type': 'application/json'}
     response = issue_request(config, 'PATCH', endpoint, headers, media_json)
     if response.status_code == 200:
-        logging.info("Media %s Islandora Media Use terms updated.", config['host'] + '/media/' + str(media_id) + '/edit')
+        logging.info("Media %s Islandora Media Use terms updated.", endpoint)
     else:
-        logging.warning("Media %s Islandora Media Use terms not updated.", config['host'] + '/media/' + str(media_id) + '/edit')
+        logging.warning("Media %s Islandora Media Use terms not updated.", endpoint)
 
 
 def clean_image_alt_text(input_string):
@@ -2501,7 +2650,10 @@ def patch_image_alt_text(config, media_id, node_csv_row):
     """Patch the alt text value for an image media. Use the parent node's title
        unless the CSV record contains an image_alt_text field with something in it.
     """
-    get_endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
+    if config['standalone_media_url'] is True:
+        get_endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+    else:
+        get_endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
     get_headers = {'Content-Type': 'application/json'}
     get_response = issue_request(config, 'GET', get_endpoint, get_headers)
     get_response_body = json.loads(get_response.text)
@@ -2522,7 +2674,10 @@ def patch_image_alt_text(config, media_id, node_csv_row):
         ],
     }
 
-    patch_endpoint = config['host'] + '/media/' + media_id + '/edit?_format=json'
+    if config['standalone_media_url'] is True:
+        patch_endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+    else:
+        patch_endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
     patch_headers = {'Content-Type': 'application/json'}
     patch_response = issue_request(
         config,
@@ -2532,14 +2687,17 @@ def patch_image_alt_text(config, media_id, node_csv_row):
         media_json)
 
     if patch_response.status_code != 200:
-        logging.warning("Alt text for image media %s not updated.", config['host'] + '/media/' + media_id + + '/edit')
+        logging.warning("Alt text for image media %s not updated.", patch_endpoint)
 
 
 def remove_media_and_file(config, media_id):
     """Delete a media and the file associated with it.
     """
     # First get the media JSON.
-    get_media_url = '/media/' + str(media_id) + '/edit?_format=json'
+    if config['standalone_media_url'] is True:
+        get_media_url = config['host'] + '/media/' + str(media_id) + '?_format=json'
+    else:
+        get_media_url = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
     get_media_response = issue_request(config, 'GET', get_media_url)
     get_media_response_body = json.loads(get_media_response.text)
 
@@ -2558,20 +2716,28 @@ def remove_media_and_file(config, media_id):
         'field_media_video_file']
     for file_field_name in file_fields:
         if file_field_name in get_media_response_body:
-            file_id = get_media_response_body[file_field_name][0]['target_id']
+            try:
+                file_id = get_media_response_body[file_field_name][0]['target_id']
+            except Exception as e:
+                logging.error("Unable to get file ID for media %s (reason: %s); proceeding to delete media without file.", media_id, e)
+                file_id = None
             break
 
     # Delete the file first.
-    file_endpoint = config['host'] + '/entity/file/' + str(file_id) + '?_format=json'
-    file_response = issue_request(config, 'DELETE', file_endpoint)
-    if file_response.status_code == 204:
-        logging.info("File %s (from media %s) deleted.", file_id, media_id)
-    else:
-        logging.error("File %s (from media %s) not deleted (HTTP response code %s).", file_id, media_id, file_response.status_code)
+    if file_id is not None:
+        file_endpoint = config['host'] + '/entity/file/' + str(file_id) + '?_format=json'
+        file_response = issue_request(config, 'DELETE', file_endpoint)
+        if file_response.status_code == 204:
+            logging.info("File %s (from media %s) deleted.", file_id, media_id)
+        else:
+            logging.error("File %s (from media %s) not deleted (HTTP response code %s).", file_id, media_id, file_response.status_code)
 
     # Then the media.
-    if file_response.status_code == 204:
-        media_endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
+    if file_response.status_code == 204 or file_id is None:
+        if config['standalone_media_url'] is True:
+            media_endpoint = config['host'] + '/media/' + str(media_id) + '?_format=json'
+        else:
+            media_endpoint = config['host'] + '/media/' + str(media_id) + '/edit?_format=json'
         media_response = issue_request(config, 'DELETE', media_endpoint)
         if media_response.status_code == 204:
             logging.info("Media %s deleted.", media_id)
@@ -2731,18 +2897,47 @@ def get_csv_data(config, csv_file_target='node_fields', file_path=None):
 
 
 def find_term_in_vocab(config, vocab_id, term_name_to_find):
-    """For a given term name, query using the vocab_id to see if term_name_to_find
+    """Query the Term from term name View using the vocab_id to see if term_name_to_find is
        is found in that vocabulary. If so, returns the term ID; if not returns False. If
        more than one term found, returns the term ID of the first one. Also populates global
        lists of terms (checked_terms and newly_created_terms) to reduce queries to Drupal.
+    """
+    """Parameters
+    ----------
+    config : dict
+        The configuration object defined by set_config_defaults().
+    vocab_id: string
+        The vocabulary ID to use in the query to find the term.
+    field_name: string
+        The field's machine name.
+    term_name_to_find: string
+        The term name from CSV.
+    Returns
+    -------
+    int|boolean
+        The term ID, existing or newly created. Returns False if term name
+        is not found (or config['validate_terms_exist'] is False).
     """
     if 'check' in config.keys() and config['check'] is True:
         if config['validate_terms_exist'] is False:
             return False
 
-        # Namespaced terms (inc. typed relation terms): if there is a vocabulary namespace, we need to split it out
+        # Attempt to detect term names (including typed relation taxonomy terms) that are namespaced. Some term names may
+        # contain a colon (which is used in the incoming CSV to seprate the vocab ID from the term name). If there is
+        # a ':', maybe it's part of the term name and it's not namespaced. To find out, split term_name_to_find
+        # and compare the first segment with the vocab_id.
+        if ':' in term_name_to_find:
+            original_term_name_to_find = copy.copy(term_name_to_find)
+            [tentative_vocab_id, tentative_term_name] = term_name_to_find.split(':', maxsplit=1)
+            if tentative_vocab_id.strip() == vocab_id.strip():
+                term_name_to_find = tentative_term_name
+            else:
+                term_name_to_find = original_term_name_to_find
+
+        '''
+        # Namespaced terms (inc. typed relation terms): if a vocabulary namespace is present, we need to split it out
         # from the term name. This only applies in --check since namespaced terms are parsed in prepare_term_id().
-        # Assumptions: the term namespace always directly precedes the term name, and the term name doesn't
+        # Assumptions: the term namespace always directly precedes the term name, and the term name may
         # contain a colon. See https://github.com/mjordan/islandora_workbench/issues/361 for related logic.
         namespaced = re.search(':', term_name_to_find)
         if namespaced:
@@ -2750,6 +2945,7 @@ def find_term_in_vocab(config, vocab_id, term_name_to_find):
             # Assumption is that the term name is the last part, and the namespace is the second-last.
             term_name_to_find = namespaced_term_parts[-1]
             vocab_id = namespaced_term_parts[-2]
+        '''
 
         term_name_for_check_matching = term_name_to_find.lower().strip()
         for checked_term in checked_terms:
@@ -3149,13 +3345,27 @@ def create_url_alias(config, node_id, url_alias):
             response.status_code)
 
 
-def prepare_term_id(config, vocab_ids, term):
-    """REST POST and PATCH operations require taxonomy term IDs, not term names. This
-       funtion checks its 'term' argument to see if it's numeric (i.e., a term ID) and
-       if it is, returns it as is. If it's not (i.e., a term name) it looks for the
-       term name in the referenced vocabulary and returns its term ID (existing or
-       newly created).
+def prepare_term_id(config, vocab_ids, field_name, term):
+    """Checks to see if 'term' is numeric (i.e., a term ID) and if it is, returns it as
+       is. If it's not (i.e., it's a string term name) it looks for the term name in the
+       referenced vocabulary and returns its term ID if the term exists, and if it doesn't
+       exist, creates the term and returns the new term ID.
     """
+    """Parameters
+    ----------
+    config : dict
+        The configuration object defined by set_config_defaults().
+    vocab_ids: list
+        The vocabulary IDs associated with the field handling code calling this function.
+    field_name: string
+        The field's machine name.
+    term: string
+        The term name from CSV.
+    Returns
+    -------
+    int
+        The term ID, existing or newly created.
+"""
     term = str(term)
     term = term.strip()
     if value_is_numeric(term):
@@ -3169,13 +3379,18 @@ def prepare_term_id(config, vocab_ids, term):
             return tid_from_uri
     else:
         if len(vocab_ids) == 1:
-            # A namespace is not needed since this vocabulary is the only one linked to
-            # its field, so we remove it before sending it to create_term().
+            # A namespace is not needed but it might be present. If there is,
+            # since this vocabulary is the only one linked to its field,
+            # we remove it before sending it to create_term().
             namespaced = re.search(':', term)
             if namespaced:
                 [vocab_id, term_name] = term.split(':', maxsplit=1)
-                tid = create_term(config, vocab_id.strip(), term_name.strip())
-                return tid
+                if vocab_id == vocab_ids[0]:
+                    tid = create_term(config, vocab_id.strip(), term_name.strip())
+                    return tid
+                else:
+                    tid = create_term(config, vocab_ids[0].strip(), term.strip())
+                    return tid
             else:
                 tid = create_term(config, vocab_ids[0].strip(), term.strip())
                 return tid
@@ -3187,16 +3402,22 @@ def prepare_term_id(config, vocab_ids, term):
             # vocabulary the user wants a new term to be added to, and if the term name is
             # already used in any of the taxonomies linked to this field, we also don't know
             # which vocabulary to look for it in to get its term ID. Therefore, we always need
-            # to namespace term names if they are used in multi-taxonomy fields. If people want
-            # to use term names that contain a colon, they need to add them to Drupal first
-            # and use the term ID. Workaround PRs welcome.
+            # to namespace term names if they are used in multi-taxonomy fields.
             #
             # Split the namespace/vocab ID from the term name on ':'.
-            namespaced = re.search(':', term)
-            if namespaced:
-                [vocab_id, term_name] = term.split(':', maxsplit=1)
-                tid = create_term(config, vocab_id.strip(), term_name.strip())
+            if ':' in term:
+                [tentative_vocab_id, term_name] = term.split(':', maxsplit=1)
+                for vocab_id in vocab_ids:
+                    if tentative_vocab_id == vocab_id:
+                        tid = create_term(config, vocab_id.strip(), term_name.strip())
+                        return tid
+            else:
+                tid = create_term(config, vocab_ids.strip(), term.strip())
                 return tid
+
+        # Explicitly return None if hasn't retured from one of the conditions above, e.g. if
+        # the term name contains a colon and it wasn't namespaced with a valid vocabulary ID.
+        return None
 
 
 def get_field_vocabularies(config, field_definitions, field_name):
@@ -3622,6 +3843,8 @@ def validate_taxonomy_field_values(config, field_definitions, csv_data):
                 # will be False and will throw a TypeError.
                 try:
                     num_vocabs = len(vocabularies)
+                    if num_vocabs > 0:
+                        fields_with_vocabularies.append(column_name)
                 except BaseException:
                     message = 'Workbench cannot get vocabularies linked to field "' + column_name + '". Please confirm that field has at least one vocabulary.'
                     logging.error(message)
@@ -3751,6 +3974,8 @@ def validate_typed_relation_field_values(config, field_definitions, csv_data):
                 # will be False and will throw a TypeError.
                 try:
                     num_vocabs = len(vocabularies)
+                    if num_vocabs > 0:
+                        fields_with_vocabularies.append(column_name)
                 except BaseException:
                     message = 'Workbench cannot get vocabularies linked to field "' + column_name + '". Please confirm that field has at least one vocabulary.'
                     logging.error(message)
@@ -3823,36 +4048,29 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
     # Allow for multiple values in one field.
     terms_to_check = csv_field_value.split(config['subdelimiter'])
     for field_value in terms_to_check:
-        # If this is a multi-taxonomy field, all term names must be namespaced
-        # using the vocab_id:term_name pattern, regardless of whether
-        # config['allow_adding_terms'] is True.
-        if len(this_fields_vocabularies) > 1 and value_is_numeric(field_value) is not True and not field_value.startswith('http'):
-            # URIs are unique so don't need namespacing.
+        # If this is a multi-taxonomy field, all term names (not IDs or URIs) must be namespaced using the vocab_id:term_name pattern,
+        # regardless of whether config['allow_adding_terms'] is True. Also, we need to accommodate terms that are namespaced
+        # and also contain a ':'.
+        if len(this_fields_vocabularies) > 1 and value_is_numeric(field_value) is False and not field_value.startswith('http'):
             split_field_values = field_value.split(config['subdelimiter'])
             for split_field_value in split_field_values:
-                namespaced = re.search(':', field_value)
-                if namespaced:
-                    # If the : is present, validate that the namespace is one of
-                    # the vocabulary IDs referenced by this field.
-                    field_value_parts = field_value.split(':')
-                    if field_value_parts[0] not in this_fields_vocabularies:
-                        message = 'Vocabulary ID "' + field_value_parts[0] + \
-                            '" used in CSV column "' + csv_field_name + '", row ' + str(record_number) + \
-                            ' does not match any of the vocabularies referenced by the' + \
-                            ' corresponding Drupal field (' + this_fields_vocabularies_string + ').'
+                if ':' in field_value:
+                    # If the : is present, validate that the namespace is one of the vocabulary IDs referenced by this field.
+                    [tentative_namespace, tentative_term_name] = field_value.split(':', 1)
+                    if tentative_namespace not in this_fields_vocabularies:
+                        message = 'Vocabulary ID "' + tentative_namespace + '" used in CSV column "' + csv_field_name + '", row ' + str(record_number) + \
+                            ' does not match any of the vocabularies referenced by the' + ' corresponding Drupal field (' + this_fields_vocabularies_string + ').'
                         logging.error(message)
                         sys.exit('Error: ' + message)
                 else:
-                    message = 'Term names in multi-vocabulary CSV field "' + csv_field_name + '" require a vocabulary namespace; value '
-                    message_2 = '"' + field_value + '" in row ' \
-                        + str(record_number) + ' does not have one.'
+                    message = 'Term names in CSV field "' + csv_field_name + '" require a vocabulary namespace; CSV value '
+                    message_2 = '"' + field_value + '" in row ' + str(record_number) + ' does not have one.'
                     logging.error(message + message_2)
                     sys.exit('Error: ' + message + message_2)
 
                 validate_term_name_length(split_field_value, str(record_number), csv_field_name)
 
-        # Check to see if field_value is a member of the field's vocabularies. First,
-        # check whether field_value is a term ID.
+        # Check to see if field_value is a member of the field's vocabularies. First, check whether field_value is a term ID.
         if value_is_numeric(field_value):
             field_value = field_value.strip()
             term_in_vocabs = False
@@ -3897,7 +4115,7 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
             new_terms_to_add = []
             for vocabulary in this_fields_vocabularies:
                 tid = find_term_in_vocab(config, vocabulary, field_value)
-                if value_is_numeric(tid) is not True:
+                if value_is_numeric(tid) is False:
                     # Single taxonomy fields.
                     if len(this_fields_vocabularies) == 1:
                         if config['allow_adding_terms'] is True:
@@ -3917,9 +4135,8 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                             logging.error(message + message_2)
                             sys.exit('Error: ' + message + message_2)
 
-                # If this is a multi-taxonomy field, all term names must be namespaced using
-                # the vocab_id:term_name pattern, regardless of whether
-                # config['allow_adding_terms'] is True.
+                # If this is a multi-taxonomy field, all term names must be namespaced using the vocab_id:term_name pattern,
+                # regardless of whether config['allow_adding_terms'] is True.
                 if len(this_fields_vocabularies) > 1:
                     split_field_values = field_value.split(config['subdelimiter'])
                     for split_field_value in split_field_values:
@@ -3927,7 +4144,7 @@ def validate_taxonomy_reference_value(config, field_definitions, csv_field_name,
                         [namespace_vocab_id, namespaced_term_name] = split_field_value.split(':', 1)
                         if namespace_vocab_id not in this_fields_vocabularies:
                             message = 'CSV field "' + csv_field_name + '" in row ' + str(record_number) + ' contains a namespaced term name '
-                            message_2 = '(' + namespaced_term_name.strip() + '") that specifies a vocabulary not associated with that field.'
+                            message_2 = '("' + namespaced_term_name.strip() + '") that specifies a vocabulary not associated with that field (' + namespace_vocab_id + ').'
                             logging.error(message + message_2)
                             sys.exit('Error: ' + message + message_2)
 
@@ -4788,7 +5005,8 @@ def prep_node_ids_tsv(config):
 
     # Write to the data file the names of config files identified in config['secondary_tasks']
     # since we need a way to ensure that only tasks whose names are registered there should
-    # populate their objects' 'field_member_of'.
+    # populate their objects' 'field_member_of'. We write the parent ID->nid map to this file
+    # as well, in write_to_node_ids_tsv().
     for secondary_config_file in config['secondary_tasks']:
         tsv_file.write(secondary_config_file + "\t" + '' + "\n")
     tsv_file.close()
@@ -4822,6 +5040,29 @@ def read_node_ids_tsv(config):
     return map
 
 
+def get_entity_reference_view_endpoints(config):
+    """Gets entity reference View endpoints from config.
+    """
+    """Parameters
+        ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
+        Returns
+        -------
+        dict
+            Dictionary with Drupal field names as keys and View REST endpoints as values.
+    """
+    endpoint_mappings = dict()
+    if 'entity_reference_view_endpoints' not in config:
+        return endpoint_mappings
+
+    for endpoint_mapping in config['entity_reference_view_endpoints']:
+        for field_name, endpoint in endpoint_mapping.items():
+            endpoint_mappings[field_name] = endpoint
+
+    return endpoint_mappings
+
+
 def get_percentage(part, whole):
     return 100 * float(part) / float(whole)
 
@@ -4831,6 +5072,8 @@ def calculate_response_time_trend(config, response_time):
     """
     """Parameters
         ----------
+        config : dict
+            The configuration object defined by set_config_defaults().
         response_time : Response time of current request, in seconds.
             The string to test.
         Returns

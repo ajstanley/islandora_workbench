@@ -38,6 +38,9 @@ class SimpleField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         # Cardinality is unlimited.
         if field_definitions[field_name]['cardinality'] == -1:
@@ -101,6 +104,9 @@ class SimpleField():
         """
         if config['update_mode'] == 'delete':
             entity[field_name] = []
+            return entity
+
+        if row[field_name] is None:
             return entity
 
         # Cardinality has a limit.
@@ -211,6 +217,9 @@ class SimpleField():
         if 'field_type' not in field_definitions[field_name]:
             return values
 
+        if row[field_name] is None:
+            return entity
+
         if field_definitions[field_name]['field_type'] == 'edtf':
             valid_values = list()
             for subvalue in values:
@@ -244,6 +253,9 @@ class SimpleField():
         """
         if 'field_type' not in field_definitions[field_name]:
             return values
+
+        if row[field_name] is None:
+            return entity
 
         subvalues = list()
         for subvalue in field_data:
@@ -288,6 +300,9 @@ class GeolocationField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         # Cardinality is unlimited.
         if field_definitions[field_name]['cardinality'] == -1:
@@ -343,6 +358,9 @@ class GeolocationField():
         """
         if config['update_mode'] == 'delete':
             entity[field_name] = []
+            return entity
+
+        if row[field_name] is None:
             return entity
 
         # Cardinality is unlimited.
@@ -501,6 +519,9 @@ class LinkField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         # Cardinality is unlimited.
         if field_definitions[field_name]['cardinality'] == -1:
@@ -553,6 +574,9 @@ class LinkField():
         """
         if config['update_mode'] == 'delete':
             entity[field_name] = []
+            return entity
+
+        if row[field_name] is None:
             return entity
 
         # Cardinality is unlimited.
@@ -716,6 +740,9 @@ class EntityReferenceField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         if field_definitions[field_name]['target_type'] == 'taxonomy_term':
             target_type = 'taxonomy_term'
@@ -724,7 +751,7 @@ class EntityReferenceField():
                 prepared_tids = []
                 delimited_values = row[field_name].split(config['subdelimiter'])
                 for delimited_value in delimited_values:
-                    tid = prepare_term_id(config, field_vocabs, delimited_value)
+                    tid = prepare_term_id(config, field_vocabs, field_name, delimited_value)
                     if value_is_numeric(tid):
                         tid = str(tid)
                         prepared_tids.append(tid)
@@ -732,7 +759,7 @@ class EntityReferenceField():
                         continue
                 row[field_name] = config['subdelimiter'].join(prepared_tids)
             else:
-                row[field_name] = prepare_term_id(config, field_vocabs, row[field_name])
+                row[field_name] = prepare_term_id(config, field_vocabs, field_name, row[field_name])
                 if value_is_numeric(row[field_name]):
                     row[field_name] = str(row[field_name])
 
@@ -806,6 +833,9 @@ class EntityReferenceField():
             entity[field_name] = []
             return entity
 
+        if row[field_name] is None:
+            return entity
+
         if field_definitions[field_name]['target_type'] == 'taxonomy_term':
             target_type = 'taxonomy_term'
             field_vocabs = get_field_vocabularies(config, field_definitions, field_name)
@@ -813,7 +843,7 @@ class EntityReferenceField():
                 prepared_tids = []
                 delimited_values = row[field_name].split(config['subdelimiter'])
                 for delimited_value in delimited_values:
-                    tid = prepare_term_id(config, field_vocabs, delimited_value)
+                    tid = prepare_term_id(config, field_vocabs, field_name, delimited_value)
                     if value_is_numeric(tid):
                         tid = str(tid)
                         prepared_tids.append(tid)
@@ -821,7 +851,7 @@ class EntityReferenceField():
                         continue
                 row[field_name] = config['subdelimiter'].join(prepared_tids)
             else:
-                row[field_name] = prepare_term_id(config, field_vocabs, row[field_name])
+                row[field_name] = prepare_term_id(config, field_vocabs, field_name, row[field_name])
                 if value_is_numeric(row[field_name]):
                     row[field_name] = str(row[field_name])
 
@@ -1004,6 +1034,9 @@ class TypedRelationField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         # Currently only supports Typed Relation taxonomy entities.
         if field_definitions[field_name]['target_type'] == 'taxonomy_term':
@@ -1016,11 +1049,11 @@ class TypedRelationField():
                 subvalues = self.dedupe_values(subvalues)
                 if config['subdelimiter'] in row[field_name]:
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         field_values.append(subvalue)
                     entity[field_name] = field_values
                 else:
-                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, subvalues[0]['target_id'])
+                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalues[0]['target_id'])
                     entity[field_name] = subvalues
             # Cardinality has a limit.
             elif field_definitions[field_name]['cardinality'] > 1:
@@ -1032,18 +1065,18 @@ class TypedRelationField():
                         log_field_cardinality_violation(field_name, id_field, field_definitions[field_name]['cardinality'])
                         subvalues = subvalues[:field_definitions[field_name]['cardinality']]
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         field_values.append(subvalue)
                     entity[field_name] = field_values
                 else:
                     field_value = split_typed_relation_string(config, row[field_name], target_type)
-                    field_value[0]['target_id'] = prepare_term_id(config, field_vocabs, field_value[0]['target_id'])
+                    field_value[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, field_value[0]['target_id'])
                     entity[field_name] = field_value
             # Cardinality is 1.
             else:
                 subvalues = split_typed_relation_string(config, row[field_name], target_type)
                 subvalues = self.dedupe_values(subvalues)
-                subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, subvalues[0]['target_id'])
+                subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalues[0]['target_id'])
                 entity[field_name] = [subvalues[0]]
                 if len(subvalues) > 1:
                     log_field_cardinality_violation(field_name, id_field, '1')
@@ -1079,6 +1112,9 @@ class TypedRelationField():
             entity[field_name] = []
             return entity
 
+        if row[field_name] is None:
+            return entity
+
         # Currently only supports Typed Relation taxonomy entities.
         if field_definitions[field_name]['target_type'] == 'taxonomy_term':
             target_type = 'taxonomy_term'
@@ -1092,21 +1128,21 @@ class TypedRelationField():
                 if config['subdelimiter'] in row[field_name]:
                     field_values = []
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         field_values.append(subvalue)
                     if len(field_values) > int(field_definitions[field_name]['cardinality']):
                         field_values = field_values[:field_definitions[field_name]['cardinality']]
                         log_field_cardinality_violation(field_name, row['node_id'], field_definitions[field_name]['cardinality'])
                     entity[field_name] = field_values
                 else:
-                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, subvalues[0]['target_id'])
+                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalues[0]['target_id'])
                     entity[field_name] = subvalues
             if config['update_mode'] == 'append':
                 if config['subdelimiter'] in row[field_name]:
                     field_values = []
                     subvalues = split_typed_relation_string(config, row[field_name], target_type)
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         entity_field_values.append(subvalue)
                     entity_field_values = self.dedupe_values(entity_field_values)
                     if len(entity_field_values) > int(field_definitions[field_name]['cardinality']):
@@ -1116,7 +1152,7 @@ class TypedRelationField():
                         entity[field_name] = entity_field_values
                 else:
                     csv_typed_relation_value = split_typed_relation_string(config, row[field_name], target_type)
-                    csv_typed_relation_value[0]['target_id'] = prepare_term_id(config, field_vocabs, csv_typed_relation_value[0]['target_id'])
+                    csv_typed_relation_value[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, csv_typed_relation_value[0]['target_id'])
                     entity_field_values.append(csv_typed_relation_value[0])
                     entity_field_values = self.dedupe_values(entity_field_values)
                     if len(entity_field_values) > int(field_definitions[field_name]['cardinality']):
@@ -1133,22 +1169,22 @@ class TypedRelationField():
                 if config['subdelimiter'] in row[field_name]:
                     field_values = []
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         field_values.append(subvalue)
                     entity[field_name] = field_values
                 else:
-                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, subvalues[0]['target_id'])
+                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalues[0]['target_id'])
                     entity[field_name] = subvalues
             if config['update_mode'] == 'append':
                 subvalues = split_typed_relation_string(config, row[field_name], target_type)
                 if config['subdelimiter'] in row[field_name]:
                     field_values = []
                     for subvalue in subvalues:
-                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, subvalue['target_id'])
+                        subvalue['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalue['target_id'])
                         entity_field_values.append(subvalue)
                     entity[field_name] = self.dedupe_values(entity_field_values)
                 else:
-                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, subvalues[0]['target_id'])
+                    subvalues[0]['target_id'] = prepare_term_id(config, field_vocabs, field_name, subvalues[0]['target_id'])
                     entity_field_values.append(subvalues[0])
                     entity[field_name] = self.dedupe_values(entity_field_values)
 
@@ -1265,6 +1301,9 @@ class AuthorityLinkField():
             dictionary
                 A dictionary represeting the entity that is POSTed to Drupal as JSON.
         """
+        if row[field_name] is None:
+            return entity
+
         id_field = row[config['id_field']]
         # Cardinality is unlimited.
         if field_definitions[field_name]['cardinality'] == -1:
@@ -1317,6 +1356,9 @@ class AuthorityLinkField():
         """
         if config['update_mode'] == 'delete':
             entity[field_name] = []
+            return entity
+
+        if row[field_name] is None:
             return entity
 
         # Cardinality is unlimited.

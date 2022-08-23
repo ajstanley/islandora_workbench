@@ -111,8 +111,14 @@ def create():
         secondary_task_data = read_node_ids_tsv(config)
         if args.config in secondary_task_data:
             if len(secondary_task_data) > 0:
-                if 'field_member_of' in row and 'parent_id' in row and row['field_member_of'] in secondary_task_data.keys():
+                if 'field_member_of' in row and 'parent_id' in row and row['parent_id'] in secondary_task_data.keys():
                     row['field_member_of'] = secondary_task_data[row['parent_id']]
+                else:
+                    # If there is no parent ID/nid pair in the secondary_task_data mapping,
+                    # either because it wasn't in the primary CSV or it failed to be created
+                    # in the primary task, skip creating the current secondary node and move on.
+                    logging.warning('Node for row with ID %s in secondary task CSV not created because its parent was not present or not created in the primary task.', id_field)
+                    continue
 
         # Add custom (non-required) CSV fields.
         entity_fields = get_entity_fields(config, 'node', config['content_type'])
@@ -250,7 +256,7 @@ def create():
             node_nid = node_uri.rsplit('/', 1)[-1]
             node_ids[id_field] = node_nid
 
-            if config['secondary_tasks'] is not None and len(config['secondary_tasks']) > 0 and len(secondary_task_data) > 0:
+            if config['secondary_tasks'] is not None and len(config['secondary_tasks']) > 0:
                 if args.config not in config['secondary_tasks']:
                     write_to_node_ids_tsv(config, id_field, node_id)
 
@@ -316,7 +322,7 @@ def create():
 
             if config['nodes_only'] is False and 'file' in row and len(row['file']) == 0 and 'additional_files' not in config and config['paged_content_from_directories'] is False:
                 if config['progress_bar'] is False:
-                    print('+ No files specified in CSV for row ' + str(id_field))
+                    print('+ No files specified in CSV for row ' + str(id_field) + '.')
                 logging.info("No files specified for row %s, so no media created.", str(id_field))
 
             if config['paged_content_from_directories'] is True:
@@ -992,7 +998,7 @@ def get_data_from_view():
 
     view_parameters = '&'.join(config['view_parameters']) if 'view_parameters' in config else ''
     view_url = config['host'] + '/' + config['view_path'].lstrip('/') + '?page=0&' + view_parameters
-    view_path_status_code = ping_view_path(config, view_url)
+    view_path_status_code = ping_view_endpoint(config, view_url)
     if view_path_status_code != 200:
         message = f"Cannot access View at {view_url}."
         logging.error(message + " HTTP status code is " + str(view_path_status_code) + ".")
@@ -1209,6 +1215,13 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%d-%b-%y %H:%M:%S')
 
+# Execute bootstrap scripts, if any are configured.
+if config['check'] is False and 'bootstrap' in config and len(config['bootstrap']) > 0:
+    for command in config['bootstrap']:
+        print("Executing bootstrap script " + command)
+        output, return_code = execute_bootstrap_script(command, args.config)
+        logging.info(f"Bootstrap script {command} exited with {return_code}.")
+
 if config['task'] != 'create_from_files' and config['input_csv'].startswith('http') is True:
     get_csv_from_google_sheet(config)
 if config['task'] != 'create_from_files' and config['input_csv'].endswith('.xlsx') is True:
@@ -1263,12 +1276,6 @@ except KeyboardInterrupt:
     except SystemExit:
         os._exit(0)
 
-# Execute bootstrap scripts, if any are configured.
-if 'bootstrap' in config and len(config['bootstrap']) > 0:
-    for command in config['bootstrap']:
-        print("Executing bootstrap script " + command)
-        output, return_code = execute_bootstrap_script(command, args.config)
-
 try:
     if config['task'] == 'create':
         create()
@@ -1298,7 +1305,7 @@ try:
             print(message)
             logging.info(message)
             if os.name == 'nt':
-                # Assumes python.exe is in the user's PATH.            
+                # Assumes python.exe is in the user's PATH.
                 cmd = ["python", "./workbench", "--config", secondary_config_file]
             else:
                 cmd = ["./workbench", "--config", secondary_config_file]
@@ -1307,6 +1314,13 @@ try:
         map_file_path = os.path.join(config['input_dir'], config['secondary_tasks_data_file'])
         if os.path.exists(map_file_path):
             os.remove(map_file_path)
+
+    # Execute shutdown scripts, if any are configured.
+    if config['check'] is False and 'shutdown' in config and len(config['shutdown']) > 0:
+        for command in config['shutdown']:
+            print("Executing shutdown script " + command)
+            output, return_code = execute_shutdown_script(command, args.config)
+            logging.info(f"Shutdown script {command} exited with {return_code}.")
 
     logging.info(f"Islandora Workbench successfully completed.")
 
