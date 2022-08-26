@@ -283,12 +283,12 @@ def create():
             allowed_media_response_codes = [201, 204]
             if config['nodes_only'] is False and 'file' in row and len(row['file']) != 0:
                 if config['add_media_attempts'] < 1:
-                    config['add_media_attempts'] = 0
-                while count < config['add_media_attempts']:
-                    count = count + 1
+                    config['add_media_attempts'] = 1
+                media_attempts = 0
+                while media_attempts < config['add_media_attempts']:
+                    media_attempts = media_attempts + 1
                     if drupal_8 is True:
-                        media_response_status_code = create_islandora_media(config, row['file'], 'file', node_uri,
-                                                                            row_for_media)
+                        media_response_status_code = create_islandora_media(config, row['file'], 'file', node_uri, row_for_media)
                     else:
                         media_response_status_code = create_media(config, row['file'], 'file', node_nid, row_for_media)
                     if media_response_status_code in allowed_media_response_codes:
@@ -300,9 +300,10 @@ def create():
                     else:
                         if config['progress_bar'] is False:
                             print(
-                                f"- ERROR: Media for {row['file']} not created on attempt {count}. See log for more information.")
+                                f"- ERROR: Media for {row['file']} not created on attempt {media_attempts}. See log for more information.")
                         logging.error(
                             f"Media for {row['file']} not created (HTTP response code {media_response_status_code}.")
+
 
             if config['nodes_only'] is False and 'additional_files' in config:
                 additional_files_config = get_additional_files_config(config)
