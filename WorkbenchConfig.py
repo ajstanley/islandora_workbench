@@ -169,7 +169,8 @@ class WorkbenchConfig:
             'export_csv_file_path': None,
             'export_csv_field_list': [],
             'data_from_view_file_path': None,
-            'standalone_media_url': False
+            'standalone_media_url': False,
+            'add_media_attempts': 1
         }
 
     # Tests validity and existence of path.
