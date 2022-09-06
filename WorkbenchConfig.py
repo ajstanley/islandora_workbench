@@ -84,7 +84,8 @@ class WorkbenchConfig:
             {'file': ['tif', 'tiff', 'jp2', 'zip', 'tar']},
             {'audio': ['mp3', 'wav', 'aac']},
             {'video': ['mp4']},
-            {'extracted_text': ['txt']}
+            {'extracted_text': ['txt']},
+            {'fits_technical_metadata': ['xml']}
         ]
 
     # Returns default configs, to be updated by user-supplied config.
