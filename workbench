@@ -342,7 +342,10 @@ def create():
         if node_response.status_code == 201:
             allowed_media_response_codes = [201, 204]
             if config['nodes_only'] is False and 'file' in row and len(row['file'].strip()) != 0:
-                media_response_status_code = create_media(config, row['file'], 'file', node_id, row_for_media)
+                for i in range(config['media_creations_attempts']):
+                    media_response_status_code = create_media(config, row['file'], 'file', node_id, row_for_media)
+                    if media_response_status_code in allowed_media_response_codes:
+                        break
                 if media_response_status_code in allowed_media_response_codes:
                     if config['progress_bar'] is False:
                         print("+ Media for " + row['file'] + " created.")
@@ -692,7 +695,11 @@ def add_media():
                     if config['allow_missing_files'] is False:
                         sys.exit('Error: ' + message)
                 else:
-                    media_response_status_code = create_media(config, row['file'], 'file', row['node_id'], row, media_use_tid_value)
+                    for i in range(config['media_creations_attempts']):
+                        media_response_status_code = create_media(config, row['file'], 'file', row['node_id'], row, media_use_tid_value)
+                        if media_response_status_code in allowed_media_response_codes:
+                            break
+
                     if media_response_status_code in allowed_media_response_codes:
                         if config['progress_bar'] is False:
                             print('Media for "' + row['file'] + '" created and added to ' + node_uri)

@@ -239,7 +239,8 @@ class WorkbenchConfig:
             'text_format_id': 'basic_html',
             'ignore_existing_parent_ids': True,
             'query_csv_id_to_node_id_map_for_parents': False,
-            'ignore_duplicate_parent_ids': True
+            'ignore_duplicate_parent_ids': True,
+            'media_creations_attempts': 1
         }
 
     # Tests validity and existence of configuration file path.
